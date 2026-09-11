@@ -100,6 +100,27 @@ def payload_file(name: str) -> Path:
     raise FileNotFoundError(f"The installer payload is missing {name}.")
 
 
+def payload_dir(name: str) -> Path:
+    """Bundled resource folder (assets/keyboards/courses/lang)."""
+    candidates = (bundle_root() / "payload" / name, bundle_root() / name)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(f"The installer payload is missing {name}/.")
+
+
+def copy_payload_tree(source: Path, destination: Path) -> None:
+    """Merge a payload folder into the install dir (fresh files only)."""
+    for root, _dirs, files in os.walk(source):
+        relative = Path(root).relative_to(source)
+        target_dir = destination / relative
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for file in files:
+            target = target_dir / file
+            if not target.exists():
+                shutil.copy2(Path(root) / file, target)
+
+
 def shell_folder(csidl: int) -> Path:
     buffer = ctypes.create_unicode_buffer(32768)
     result = ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buffer)
@@ -229,6 +250,15 @@ def install_application(
     app_exe = install_dir / f"{APP_NAME}.exe"
     replace_file(source_app, app_exe)
     replace_file(source_uninstaller, install_dir / "uninstall.exe")
+
+    # Default lessons, keyboards, languages, and artwork travel inside the
+    # installer and are extracted next to the app (portable layout) so the
+    # user can browse and customize them.
+    for resource_dir in ("assets", "keyboards", "courses", "lang"):
+        try:
+            copy_payload_tree(payload_dir(resource_dir), install_dir / resource_dir)
+        except FileNotFoundError:
+            pass
 
     info = {
         "app": APP_NAME,

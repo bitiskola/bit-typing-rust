@@ -61,6 +61,8 @@ fn main() {
     println!("cargo:rerun-if-changed=lang");
     println!("cargo:rerun-if-changed=keyboards");
     println!("cargo:rerun-if-changed=data/sounds");
+    println!("cargo:rerun-if-changed=assets/favico.ico");
+    println!("cargo:rerun-if-env-changed=BIT_TYPING_FAVICO");
 
     let files = inventory(&project);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
@@ -79,5 +81,31 @@ fn main() {
         "cargo:rustc-env=BIT_TYPING_DEFAULT_RESOURCES={}",
         manifest_path.display()
     );
-    println!("cargo:rustc-env=BIT_TYPING_RESOURCE_COUNT={}", files.len());
+    println!(
+        "cargo:rustc-env=BIT_TYPING_RESOURCE_COUNT={}",
+        files.len()
+    );
+    embed_windows_icon();
+}
+
+/// Embed the application icon into Windows executables from a `.ico` file
+/// derived from `assets/favico.png` (`build_win.bat` generates it with
+/// Pillow and points `BIT_TYPING_FAVICO` at it). Missing toolkit or icon
+/// only warns — Linux/macOS and icon-less builds are unaffected.
+fn embed_windows_icon() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let icon = std::env::var("BIT_TYPING_FAVICO").unwrap_or_else(|_| "assets/favico.ico".into());
+    if !Path::new(&icon).is_file() {
+        println!(
+            "cargo:warning=Windows EXE icon skipped (missing {icon}); generate it from assets/favico.png first."
+        );
+        return;
+    }
+    let mut res = winres::WindowsResource::new();
+    res.set_icon(&icon);
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=Windows EXE icon skipped ({e}); rc.exe/windres is required for icons.");
+    }
 }

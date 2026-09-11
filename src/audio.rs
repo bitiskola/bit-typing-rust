@@ -26,12 +26,29 @@ pub struct ClickPlayer {
 }
 
 struct Inner {
-    queue: Mutex<VecDeque<Vec<i16>>>,
+    queue: Mutex<VecDeque<QueuedClick>>,
     wake: Condvar,
     stop: Mutex<bool>,
     key_wav: PathBuf,
     error_wav: PathBuf,
     enabled: Mutex<bool>,
+}
+
+/// One click: decoded samples (Linux PipeWire mixer) plus which wav to
+/// replay on backends that play whole files (Windows/macOS/ALSA).
+#[derive(Debug, Clone)]
+struct QueuedClick {
+    samples: Vec<i16>,
+    correct: bool,
+}
+
+/// Pick the wav for an event (pure helper, unit-tested).
+fn event_wav<'a>(key_wav: &'a Path, error_wav: &'a Path, correct: bool) -> &'a Path {
+    if correct {
+        key_wav
+    } else {
+        error_wav
+    }
 }
 
 impl ClickPlayer {
@@ -60,16 +77,16 @@ impl ClickPlayer {
         if !*self.inner.enabled.lock().unwrap() {
             return;
         }
-        let path = if correct {
-            self.inner.key_wav.clone()
-        } else {
-            self.inner.error_wav.clone()
-        };
+        let path = event_wav(&self.inner.key_wav, &self.inner.error_wav, correct).to_path_buf();
         let samples = read_wav_samples(&path).unwrap_or_default();
         if samples.is_empty() {
             return;
         }
-        self.inner.queue.lock().unwrap().push_back(samples);
+        self.inner
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(QueuedClick { samples, correct });
         self.inner.wake.notify_one();
     }
 }
@@ -115,8 +132,8 @@ fn run_pw_cat_stream(inner: Arc<Inner>) {
         }
         // One onset per chunk (FIFO parity with Python).
         let next = inner.queue.lock().unwrap().pop_front();
-        if let Some(samples) = next {
-            active.push((samples, 0));
+        if let Some(click) = next {
+            active.push((click.samples, 0));
         }
         const CHUNK: usize = 128;
         let mut mixed = [0i32; CHUNK];
@@ -171,58 +188,90 @@ fn run_pw_cat_stream(inner: Arc<Inner>) {
 
 fn run_per_event(inner: Arc<Inner>) {
     loop {
-        let samples = {
+        let click = {
             let mut guard = inner.queue.lock().unwrap();
             loop {
                 if *inner.stop.lock().unwrap() {
                     return;
                 }
-                if let Some(s) = guard.pop_front() {
-                    break Some(s);
+                if let Some(click) = guard.pop_front() {
+                    break click;
                 }
                 guard = inner.wake.wait(guard).unwrap();
             }
         };
-        let _ = samples;
-        // Re-resolve the wav path from queue order is unnecessary: per-event
-        // playback needs the raw bytes. Instead, play functions below take
-        // paths; the queue already decoded. To keep it simple, play a short
-        // synthesized beep matching the queued length via the best backend.
-        play_beep_best_effort(&inner);
+        play_event_best_effort(&inner, &click);
     }
 }
 
-fn play_beep_best_effort(inner: &Inner) {
-    // Prefer whole-file players so bundled wavs are honoured.
-    let (key, err) = (inner.key_wav.clone(), inner.error_wav.clone());
-    let _ = (key, err);
+/// Win32 wave-out playback without helper processes: instant and async.
+/// Falls back to a detached PowerShell one-shot when it fails.
+#[cfg(target_os = "windows")]
+mod win32 {
+    #[allow(non_snake_case)]
+    #[link(name = "winmm")]
+    extern "system" {
+        pub fn PlaySoundW(
+            pszSound: *const u16,
+            hmod: *const std::ffi::c_void,
+            fdwSound: u32,
+        ) -> i32;
+    }
+
+    pub const SND_FILENAME: u32 = 0x00020000;
+    pub const SND_ASYNC: u32 = 0x00000001;
+
+    /// Queue a wav file for async playback. Returns true when accepted.
+    pub fn play_wav_async(path: &std::path::Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        // SAFETY: PlaySoundW only reads the NUL-terminated file name during
+        // the call; winmm.dll is a core Windows system library.
+        unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null(), SND_FILENAME | SND_ASYNC) != 0 }
+    }
+}
+
+/// Play one queued click through the best backend. Fire-and-forget on every
+/// platform so keystrokes never block on audio. (The terminal bell at the
+/// end is unreachable on Windows, where the branch above always returns.)
+#[cfg_attr(target_os = "windows", allow(unreachable_code))]
+fn play_event_best_effort(inner: &Inner, click: &QueuedClick) {
+    // Whole-file players so bundled wavs are honoured, with the correct
+    // file per outcome. Every backend is fire-and-forget: keystrokes must
+    // never block on audio (the old blocking PlaySync made Windows sounds
+    // pile up seconds behind typing).
+    let wav = event_wav(&inner.key_wav, &inner.error_wav, click.correct).to_path_buf();
     #[cfg(target_os = "windows")]
     {
+        if win32::play_wav_async(&wav) {
+            return;
+        }
         use std::os::windows::process::CommandExt;
         let _ = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command",
                 "(New-Object System.Media.SoundPlayer $args[0]).PlaySync()"])
-            .arg(inner.key_wav.as_os_str())
+            .arg(wav.as_os_str())
             .creation_flags(0x08000000)
-            .status();
+            .spawn();
         return;
     }
     #[cfg(target_os = "macos")]
     {
         if which("afplay").is_some() {
-            let _ = Command::new("afplay").arg(&inner.key_wav).status();
+            let _ = Command::new("afplay").arg(&wav).spawn();
             return;
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         for (cmd, args) in [
-            ("pw-play", vec![inner.key_wav.to_string_lossy().to_string()]),
-            ("paplay", vec![inner.key_wav.to_string_lossy().to_string()]),
-            ("aplay", vec![inner.key_wav.to_string_lossy().to_string()]),
+            ("pw-play", vec![wav.to_string_lossy().to_string()]),
+            ("paplay", vec![wav.to_string_lossy().to_string()]),
+            ("aplay", vec![wav.to_string_lossy().to_string()]),
         ] {
             if which(cmd).is_some() {
-                let _ = Command::new(cmd).args(&args).status();
+                let _ = Command::new(cmd).args(&args).spawn();
                 return;
             }
         }
@@ -306,4 +355,32 @@ fn write_wav_mono16(path: &Path, samples: &[i16]) {
         out.extend_from_slice(&s.to_le_bytes());
     }
     let _ = std::fs::write(path, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_wav_selects_by_outcome() {
+        let key = Path::new("/s/key.wav");
+        let err = Path::new("/s/error.wav");
+        assert_eq!(event_wav(key, err, true), key);
+        assert_eq!(event_wav(key, err, false), err);
+    }
+
+    #[test]
+    fn ensure_sounds_writes_canonical_wavs() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_sounds(dir.path());
+        for name in ["key.wav", "error.wav"] {
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            assert!(bytes.len() > 44);
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            assert!(read_wav_samples(&dir.path().join(name)).is_some());
+        }
+        // Second run keeps existing files (never overwrites user data).
+        ensure_sounds(dir.path());
+    }
 }

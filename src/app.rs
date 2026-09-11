@@ -425,6 +425,29 @@ impl BitTypingApp {
         false
     }
 
+    /// The lesson owns every keystroke: a focused button turns Space/Enter
+    /// into a fake click (egui `FAKE_PRIMARY_CLICKED`), so clicking Start
+    /// would pause the lesson again at the first space instead of typing
+    /// it. Drop such focus every frame; text fields keep theirs.
+    fn drop_stolen_focus(&self, ctx: &egui::Context) {
+        if self.page != Page::Lesson
+            || self.results.is_some()
+            || self.show_options
+            || self.show_setup
+            || self.show_about
+            || self.well_done_until.is_some()
+        {
+            return;
+        }
+        // NOTE: no `wants_keyboard_input` bail-out here on purpose: on the
+        // lesson page no text field exists, and that check is true for ANY
+        // focused widget (e.g. the Start button), which would freeze both
+        // typing and this guard forever. Modals are already excluded above.
+        if let Some(id) = ctx.memory(|m| m.focused()) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
+
     /// Global key handling. Called once per frame with copied events to keep
     /// borrow rules simple. Guards mirror Swift `AppState.handle`.
     fn handle_input(&mut self, ctx: &egui::Context) {
@@ -471,9 +494,12 @@ impl BitTypingApp {
         {
             return;
         }
-        if ctx.wants_keyboard_input() {
-            return;
-        }
+        // NOTE: no `wants_keyboard_input` bail-out here on purpose: it is
+        // true for ANY focused widget (e.g. the Start button after clicking
+        // it), which froze all typing until restart. Sheets and other pages
+        // are already excluded above, and the lesson page owns no text
+        // field — `drop_stolen_focus` additionally clears button focus so
+        // Space/Enter can never turn into fake button clicks mid-lesson.
         for action in actions {
             match action {
                 Action::Escape => {
@@ -615,6 +641,7 @@ impl eframe::App for BitTypingApp {
             }
         }
 
+        self.drop_stolen_focus(ctx);
         self.handle_input(ctx);
         // Drag & drop import (drop .txt files anywhere).
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1267,9 +1294,18 @@ impl BitTypingApp {
             // Active cell painted directly (Swift CharacterCell background):
             // panel2 fill + brand outline + pending-gray glyph. A `Frame`
             // widget stretches to the full row height here, so it is never
-            // used for this cell.
-            let (cell, _) =
-                row.allocate_exact_size(egui::vec2(active_w, cell_h), egui::Sense::hover());
+            // used for this cell. On every switch the cell additionally pops
+            // (1.18x -> 1.0 over ~0.14s) so each character change is visible
+            // even at speed, when the glide alone would blur together.
+            let pop = pop_scale(
+                (Instant::now() - self.text_anim_t0).as_secs_f32(),
+                self.text_animating,
+            );
+            let (slot, _) = row.allocate_exact_size(
+                egui::vec2(active_w, cell_h),
+                egui::Sense::hover(),
+            );
+            let cell = egui::Rect::from_center_size(slot.center(), slot.size() * pop);
             row.painter().rect_filled(cell, 10.0, theme::panel2(dark));
             row.painter().rect_stroke(
                 cell,
@@ -1281,7 +1317,7 @@ impl BitTypingApp {
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
                 active_glyph,
-                egui::FontId::monospace(44.0),
+                egui::FontId::monospace(44.0 * pop),
                 theme::pending(dark),
             );
         }
@@ -1475,6 +1511,17 @@ fn display_char(ch: char) -> String {
 /// viewport (Swift `scrollTo(anchor: .center)`), without any scrolling.
 fn pinned_shift(active_cx: f32, viewport_w: f32) -> f32 {
     active_cx - viewport_w * 0.5
+}
+
+/// Active-cell pop scale: 1.18x at the switch instant, easing to 1.0 over
+/// ~0.14s. Pure function of elapsed wall time so it lands exactly even with
+/// sparse frames; frozen at 1.0 once the switch animation releases.
+fn pop_scale(elapsed_secs: f32, animating: bool) -> f32 {
+    if !animating {
+        return 1.0;
+    }
+    let q = (elapsed_secs / 0.14).min(1.0);
+    1.0 + 0.18 * (1.0 - q).powi(2)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2298,19 +2345,27 @@ impl BitTypingApp {
             .default_width(640.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                // Header: app glyph + welcome + intro (Swift SetupView).
+                // Header: bundled app icon (Swift SetupView brand mark).
                 ui.horizontal(|ui| {
-                    egui::Frame::new()
-                        .fill(theme::ink(dark))
-                        .corner_radius(egui::CornerRadius::same(14))
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("⌨")
-                                    .size(32.0)
-                                    .color(if dark { Color32::BLACK } else { Color32::WHITE }),
-                            );
-                        });
+                    if let Some(icon) = &self.brand_icon {
+                        ui.add(
+                            egui::Image::new(icon)
+                                .max_size(egui::vec2(56.0, 56.0))
+                                .corner_radius(egui::CornerRadius::same(14)),
+                        );
+                    } else {
+                        egui::Frame::new()
+                            .fill(theme::ink(dark))
+                            .corner_radius(egui::CornerRadius::same(14))
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("⌨")
+                                        .size(32.0)
+                                        .color(if dark { Color32::BLACK } else { Color32::WHITE }),
+                                );
+                            });
+                    }
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new(self.t("setup_welcome"))
@@ -3610,6 +3665,63 @@ mod tests {
         }
     }
 
+    /// Pop pulse: starts at 1.18x, eases down, rests exactly at 1.0.
+    #[test]
+    fn pop_scale_curve() {
+        assert!((pop_scale(0.0, true) - 1.18).abs() < 1e-4);
+        let mid = pop_scale(0.07, true);
+        assert!(mid > 1.0 && mid < 1.18, "easing {mid}");
+        assert_eq!(pop_scale(1.0, true), 1.0);
+        assert_eq!(pop_scale(0.0, false), 1.0);
+    }
+
+    /// Lesson focus guard: button focus is dropped so Space/Enter always
+    /// types; modals and text fields keep their focus.
+    #[test]
+    fn lesson_drops_stolen_focus() {
+        let (_tmp, app) = harness_app();
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("start-button");
+        ctx.memory_mut(|m| m.request_focus(id));
+        assert!(ctx.memory(|m| m.focused()).is_some());
+        app.drop_stolen_focus(&ctx);
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "button focus must be dropped on the lesson page"
+        );
+    }
+
+    /// End-to-end freeze regression: with the Start button focused (as after
+    /// clicking it), a keystroke must still reach the lesson — previously
+    /// `wants_keyboard_input` (true for ANY focused widget) swallowed all
+    /// typing forever, and Space additionally fake-clicked the button.
+    #[test]
+    fn lesson_types_despite_button_focus() {
+        let (_tmp, mut app) = harness_app();
+        app.current_lesson = "01".to_string();
+        app.session = Session::new("01", "keke");
+        app.start_session();
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("start-button")));
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 850.0),
+            )),
+            events: vec![egui::Event::Text("k".to_string())],
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            app.drop_stolen_focus(ctx);
+            app.handle_input(ctx);
+        });
+        assert_eq!(app.session.index, 1, "keystroke must type, not freeze");
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "button focus must be gone after the frame"
+        );
+    }
+
     /// Character-switch glide: typing starts the animation, frames ease the
     /// shift toward the new center, and it lands exactly and stays put.
     #[test]
@@ -3660,6 +3772,54 @@ mod tests {
             (app.text_shift - landed).abs() < 1e-3,
             "settled shift must be stable"
         );
+    }
+
+    /// Human-like typing simulation: 30 keystrokes at ~8 chars/sec with a
+    /// frame after each. EVERY switch must start the glide (never silently
+    /// stop animating mid-lesson), and the shift must keep tracking the
+    /// active character to the end.
+    #[test]
+    fn lesson_glide_fires_every_keystroke() {
+        let (_tmp, mut app) = harness_app();
+        app.current_lesson = "01".to_string();
+        app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
+        app.start_session();
+        let ctx = egui::Context::default();
+        let frame = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 850.0),
+            )),
+            ..Default::default()
+        };
+        let render = |app: &mut BitTypingApp, ctx: &egui::Context| {
+            let full = ctx.run(frame(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.lesson_page(ui));
+            });
+            let _ = ctx.tessellate(full.shapes, full.pixels_per_point);
+        };
+        render(&mut app, &ctx);
+        let mut switches = 0;
+        for _ in 0..30 {
+            let before = app.session.index;
+            let expected = app.session.text[before];
+            app.handle_char_input(expected);
+            assert_eq!(app.session.index, before + 1, "keystroke must advance");
+            assert!(
+                app.text_animating,
+                "switch #{switches} (index {before}) must start the glide"
+            );
+            switches += 1;
+            render(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+        assert_eq!(switches, 30);
+        // Settle fully, then the shift must sit exactly on target.
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            render(&mut app, &ctx);
+        }
+        assert!(!app.text_animating, "glide must finish after typing stops");
     }
 
     /// Lesson chrome aligns at fullscreen size (headless shape analysis):
