@@ -1,0 +1,14 @@
+{
+  "setup_complete": true,
+  "typo_mode": "Type the right character",
+  "backspace": true,
+  "goal_wpm": 30.0,
+  "goal_accuracy": 95.0,
+  "timeout_seconds": 1.6,
+  "timed_minutes": 0,
+  "metronome": false,
+  "sound": true,
+  "auto_start": true,
+  "language": "HU-hu",
+  "keyboard_layout": "HU-qwertz"
+}

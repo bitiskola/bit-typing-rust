@@ -1,0 +1,56 @@
+[package]
+name = "bit-typing"
+version = "2.0.0"
+edition = "2021"
+description = "Modern typing practice application (Rust port of bit-typing)"
+license = "MIT"
+authors = ["micr0softstore <kokai.balazs@bit-edu.hu>"]
+homepage = "https://bitiskola.github.io/bit-typing"
+repository = "https://github.com/bitiskola/bit-typing"
+keywords = ["typing", "tutor", "education", "egui"]
+categories = ["education", "gui"]
+
+[[bin]]
+name = "bit-typing"
+path = "src/main.rs"
+
+[[bin]]
+name = "bit-typing-setup"
+path = "src/bin/bit-typing-setup.rs"
+
+[[bin]]
+name = "bit-typing-uninstall"
+path = "src/bin/bit-typing-uninstall.rs"
+
+[lib]
+name = "bit_typing"
+path = "src/lib.rs"
+
+[dependencies]
+eframe = { version = "0.32", default-features = true }
+egui = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+encoding_rs = "0.8"
+sha2 = "0.10"
+rust-embed = { version = "8", features = ["include-exclude"] }
+open = "5"
+image = "0.25"
+rfd = "0.17.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 16
+strip = true
+
+[features]
+default = []
