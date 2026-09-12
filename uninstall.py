@@ -21,8 +21,15 @@ import tkinter as tk
 from PIL import Image, ImageOps
 
 
-APP_NAME = "BIT Typing"
+APP_NAME = "bit-typing"
+APP_TITLE = "BIT Typing"
 APP_VERSION = "2.0.0"
+# install-info.json `app` values accepted here: the Python installer writes
+# "bit-typing" while the older Rust setup binary wrote "BIT Typing".
+# Rejecting either one bricks uninstallation, so both validate.
+APP_IDS = ("bit-typing", "BIT Typing")
+# Local app-data folder name; must match the Rust app (paths.rs APP_NAME).
+APP_DATA_DIR_NAME = "BIT Typing"
 COLORS = {
     "bg": "#0b1020",
     "panel": "#121a2e",
@@ -120,7 +127,7 @@ def load_install_info() -> dict[str, object]:
 
 def local_data_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
-    return (Path(base) if base else Path.home() / "AppData" / "Local") / APP_NAME
+    return (Path(base) if base else Path.home() / "AppData" / "Local") / APP_DATA_DIR_NAME
 
 
 def shell_folder(csidl: int) -> Path:
@@ -131,35 +138,39 @@ def shell_folder(csidl: int) -> Path:
     return Path(buffer.value)
 
 
-def shortcut_locations(scope: str) -> tuple[Path, Path]:
+def shortcut_locations(scope: str, stem: str = APP_NAME) -> tuple[Path, Path]:
     if scope == "machine":
         return (
-            shell_folder(CSIDL_COMMON_DESKTOPDIRECTORY) / f"{APP_NAME}.lnk",
-            shell_folder(CSIDL_COMMON_PROGRAMS) / f"{APP_NAME}.lnk",
+            shell_folder(CSIDL_COMMON_DESKTOPDIRECTORY) / f"{stem}.lnk",
+            shell_folder(CSIDL_COMMON_PROGRAMS) / f"{stem}.lnk",
         )
     return (
-        shell_folder(CSIDL_DESKTOPDIRECTORY) / f"{APP_NAME}.lnk",
-        shell_folder(CSIDL_PROGRAMS) / f"{APP_NAME}.lnk",
+        shell_folder(CSIDL_DESKTOPDIRECTORY) / f"{stem}.lnk",
+        shell_folder(CSIDL_PROGRAMS) / f"{stem}.lnk",
     )
 
 
 def remove_shortcuts(scope: str) -> None:
-    for shortcut in shortcut_locations(scope):
-        try:
-            shortcut.unlink(missing_ok=True)
-        except OSError:
-            pass
+    # Remove both the current ("bit-typing.lnk") and legacy ("BIT Typing.lnk")
+    # shortcut names so older installs are fully cleaned up.
+    for stem in (APP_NAME, APP_TITLE):
+        for shortcut in shortcut_locations(scope, stem):
+            try:
+                shortcut.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def remove_registry_entry(scope: str) -> None:
     import winreg
 
     hive = winreg.HKEY_LOCAL_MACHINE if scope == "machine" else winreg.HKEY_CURRENT_USER
-    key_path = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_NAME}"
-    try:
-        winreg.DeleteKey(hive, key_path)
-    except FileNotFoundError:
-        pass
+    # Same story as shortcuts: the entry may live under either name.
+    for stem in (APP_NAME, APP_TITLE):
+        try:
+            winreg.DeleteKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{stem}")
+        except FileNotFoundError:
+            pass
 
 
 def validate_installed_directory(path: Path) -> None:
@@ -170,7 +181,7 @@ def validate_installed_directory(path: Path) -> None:
         info = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("The bit-typing installation marker is missing or invalid.") from error
-    if not isinstance(info, dict) or info.get("app") != APP_NAME:
+    if not isinstance(info, dict) or info.get("app") not in APP_IDS:
         raise ValueError("The selected directory is not a bit-typing installation.")
     if not (path / f"{APP_NAME}.exe").is_file():
         raise ValueError("The bit-typing application executable is missing.")
@@ -319,7 +330,7 @@ def begin_uninstall(info: dict[str, object], remove_data: bool) -> None:
 class UninstallerApp(ctk.CTk):
     def __init__(self, info: dict[str, object]) -> None:
         super().__init__(className=f"{APP_NAME}-uninstall")
-        apply_window_identity(self, f"Uninstall {APP_NAME}")
+        apply_window_identity(self, f"Uninstall {APP_TITLE}")
         self.info = info
         self.working = False
         self.geometry("700x500")
