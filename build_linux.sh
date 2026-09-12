@@ -90,6 +90,26 @@ mkdir -p \
 
 install -m 0755 "$BINARY" "$PACKAGE_ROOT/usr/bin/bit-typing"
 
+# System-wide default resources. The app seeds the writable per-user dirs
+# from these on first launch (and falls back to its embedded copies), so a
+# fresh install finds lessons, layouts, languages, and artwork immediately.
+install -d "$PACKAGE_ROOT/usr/share/bit-typing/courses" \
+    "$PACKAGE_ROOT/usr/share/bit-typing/keyboards" \
+    "$PACKAGE_ROOT/usr/share/bit-typing/lang" \
+    "$PACKAGE_ROOT/usr/share/bit-typing/assets"
+for lesson in "$PROJECT_DIR"/courses/*.txt; do
+    install -m 0644 "$lesson" "$PACKAGE_ROOT/usr/share/bit-typing/courses/"
+done
+for layout in "$PROJECT_DIR"/keyboards/*.json; do
+    install -m 0644 "$layout" "$PACKAGE_ROOT/usr/share/bit-typing/keyboards/"
+done
+for language in "$PROJECT_DIR"/lang/*.json; do
+    install -m 0644 "$language" "$PACKAGE_ROOT/usr/share/bit-typing/lang/"
+done
+for artwork in "$PROJECT_DIR"/assets/*.png; do
+    install -m 0644 "$artwork" "$PACKAGE_ROOT/usr/share/bit-typing/assets/"
+done
+
 cat > "$PACKAGE_ROOT/usr/share/applications/bit-typing.desktop" <<'DESKTOP'
 [Desktop Entry]
 Version=1.0

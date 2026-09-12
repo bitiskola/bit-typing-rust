@@ -130,9 +130,14 @@ pub fn bundle_source_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-fn copy_embedded<E: RustEmbed>(dest: &Path) {
+fn copy_embedded<E: RustEmbed>(dest: &Path, prefix: &str) {
+    // `E::iter()` yields prefixed names ("lang/HU-hu.json"); strip the
+    // prefix before joining, otherwise every file lands in a doubled
+    // subfolder (lang/lang/…) that the app never reads. `unwrap_or` keeps
+    // unprefixed names working too.
     for name in E::iter() {
-        let target = dest.join(name.as_ref());
+        let rel = name.as_ref().strip_prefix(prefix).unwrap_or(name.as_ref());
+        let target = dest.join(rel);
         if target.exists() {
             continue;
         }
@@ -144,6 +149,43 @@ fn copy_embedded<E: RustEmbed>(dest: &Path) {
                 continue;
             }
         }
+    }
+}
+
+/// Remove a doubled seed folder (`courses/courses/`, …) left behind by
+/// older builds. Only removes it when EVERY file inside matches a bundled
+/// name, so user data can never be deleted.
+fn remove_doubled_seed_dir<E: RustEmbed>(dest: &Path, prefix: &str) {
+    let folder = prefix.trim_end_matches('/');
+    let doubled = dest.join(folder);
+    let Ok(entries) = std::fs::read_dir(&doubled) else {
+        return;
+    };
+    let bundled: std::collections::BTreeSet<String> = E::iter()
+        .map(|n| {
+            n.as_ref()
+                .strip_prefix(prefix)
+                .unwrap_or(n.as_ref())
+                .to_string()
+        })
+        .collect();
+    let mut all_known = true;
+    let mut any = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            all_known = false;
+            break;
+        }
+        any = true;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !bundled.contains(name.as_ref()) {
+            all_known = false;
+            break;
+        }
+    }
+    if any && all_known {
+        let _ = std::fs::remove_dir_all(&doubled);
     }
 }
 
@@ -167,6 +209,27 @@ fn copy_dir_seeds(src: &Path, dest: &Path, ext: &str) {
     }
 }
 
+/// System-wide read-only resources installed by the .deb package
+/// (`/usr/share/bit-typing/...`, with a `/usr/local` fallback).
+/// `BIT_TYPING_SYSTEM_DIR` overrides it (tests, portable installs).
+pub fn system_resources_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("BIT_TYPING_SYSTEM_DIR") {
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    for candidate in [
+        PathBuf::from("/usr/share/bit-typing"),
+        PathBuf::from("/usr/local/share/bit-typing"),
+    ] {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Create writable dirs and seed bundled defaults without overwriting user data.
 pub fn ensure_dirs(root: &Path) {
     for dir in [
@@ -180,11 +243,26 @@ pub fn ensure_dirs(root: &Path) {
     }
 
     // Never overwrite user-edited lessons / translations / layouts.
-    copy_embedded::<EmbeddedCourses>(&courses_dir(root));
-    copy_embedded::<EmbeddedLangs>(&langs_dir(root));
-    copy_embedded::<EmbeddedKeyboards>(&keyboards_dir(root));
-    copy_embedded::<EmbeddedSounds>(&sounds_dir(root));
-    copy_embedded::<EmbeddedAssets>(&root.join("assets"));
+    copy_embedded::<EmbeddedCourses>(&courses_dir(root), "courses/");
+    copy_embedded::<EmbeddedLangs>(&langs_dir(root), "lang/");
+    copy_embedded::<EmbeddedKeyboards>(&keyboards_dir(root), "keyboards/");
+    copy_embedded::<EmbeddedSounds>(&sounds_dir(root), "data/sounds/");
+    copy_embedded::<EmbeddedAssets>(&root.join("assets"), "assets/");
+
+    // Remove doubled seed folders (courses/courses/, …) left by older
+    // builds; only bundled filenames are ever deleted.
+    remove_doubled_seed_dir::<EmbeddedCourses>(&courses_dir(root), "courses/");
+    remove_doubled_seed_dir::<EmbeddedLangs>(&langs_dir(root), "lang/");
+    remove_doubled_seed_dir::<EmbeddedKeyboards>(&keyboards_dir(root), "keyboards/");
+    remove_doubled_seed_dir::<EmbeddedSounds>(&sounds_dir(root), "data/sounds/");
+
+    // System package files (/usr/share/…) seed anything still missing, so a
+    // .deb install works even before embedded fallbacks kick in.
+    if let Some(system) = system_resources_dir() {
+        copy_dir_seeds(&system.join("courses"), &courses_dir(root), "txt");
+        copy_dir_seeds(&system.join("keyboards"), &keyboards_dir(root), "json");
+        copy_dir_seeds(&system.join("lang"), &langs_dir(root), "json");
+    }
 
     // App updates may add new translation keys: merge missing strings into
     // existing lang files so the UI never falls back to key names, while
@@ -311,5 +389,71 @@ mod tests {
             std::fs::read_to_string(langs.join("ZZ-custom.json")).unwrap(),
             r#"{"x":1}"#
         );
+    }
+
+    /// Fresh installs must seed a FLAT layout (courses/01.txt, not
+    /// courses/courses/01.txt) or the app finds nothing.
+    #[test]
+    fn ensure_dirs_seeds_flat_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // Parallel-safe: only asserts files this test's own seeding creates.
+        ensure_dirs(&root);
+        assert!(courses_dir(&root).join("01.txt").is_file(), "top-level lesson");
+        assert!(langs_dir(&root).join("HU-hu.json").is_file(), "top-level lang");
+        assert!(
+            std::fs::read_dir(keyboards_dir(&root)).unwrap().count() > 0,
+            "top-level layouts"
+        );
+        assert!(sounds_dir(&root).join("key.wav").is_file());
+        assert!(sounds_dir(&root).join("error.wav").is_file());
+        for doubled in [
+            courses_dir(&root).join("courses"),
+            langs_dir(&root).join("lang"),
+            keyboards_dir(&root).join("keyboards"),
+        ] {
+            assert!(!doubled.exists(), "doubled dir must not exist: {doubled:?}");
+        }
+    }
+
+    /// Doubled seed folders from older builds are removed, but only when
+    /// every file inside is a known bundled name (user data is sacred).
+    #[test]
+    fn doubled_seed_cleanup_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::env::remove_var("BIT_TYPING_SYSTEM_DIR");
+        ensure_dirs(&root);
+        // Plant a doubled folder with only bundled names -> removed.
+        let doubled = courses_dir(&root).join("courses");
+        std::fs::create_dir_all(&doubled).unwrap();
+        std::fs::write(doubled.join("01.txt"), "x").unwrap();
+        ensure_dirs(&root);
+        assert!(!doubled.exists(), "pure-bundled doubled dir removed");
+        // Plant one with a custom lesson -> preserved.
+        std::fs::create_dir_all(&doubled).unwrap();
+        std::fs::write(doubled.join("01.txt"), "x").unwrap();
+        std::fs::write(doubled.join("my-lesson.txt"), "custom").unwrap();
+        ensure_dirs(&root);
+        assert!(doubled.join("my-lesson.txt").is_file(), "custom data kept");
+    }
+
+    /// System package files seed an empty runtime dir (the .deb layout).
+    #[test]
+    fn system_dir_seeds_runtime() {
+        let system = tempfile::tempdir().unwrap();
+        for (folder, name) in [("courses", "99.txt"), ("keyboards", "ZZ.json"), ("lang", "ZZ.json")] {
+            let dir = system.path().join(folder);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), "pkg").unwrap();
+        }
+        std::env::set_var("BIT_TYPING_SYSTEM_DIR", system.path());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        ensure_dirs(&root);
+        std::env::remove_var("BIT_TYPING_SYSTEM_DIR");
+        assert!(courses_dir(&root).join("99.txt").is_file());
+        assert!(keyboards_dir(&root).join("ZZ.json").is_file());
+        assert!(langs_dir(&root).join("ZZ.json").is_file());
     }
 }
