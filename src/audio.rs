@@ -207,9 +207,13 @@ fn run_pw_cat_stream(inner: Arc<Inner>) {
 
 fn run_per_event(inner: Arc<Inner>) {
     loop {
+        // Wait for work, then keep only the freshest click: one-shot
+        // backends (and slow fallbacks) can never overlap or pile up, so a
+        // stall degrades to skipped stale clicks instead of minutes of late
+        // sounds followed by silence.
         let click = {
             let mut guard = inner.queue.lock().unwrap();
-            loop {
+            let first = loop {
                 if *inner.stop.lock().unwrap() {
                     return;
                 }
@@ -217,10 +221,19 @@ fn run_per_event(inner: Arc<Inner>) {
                     break click;
                 }
                 guard = inner.wake.wait(guard).unwrap();
-            }
+            };
+            keep_newest(first, &mut guard)
         };
         play_event_best_effort(&inner, &click);
     }
+}
+
+/// Drain stale queued clicks, keeping only the newest for playback.
+fn keep_newest<T>(mut current: T, queue: &mut VecDeque<T>) -> T {
+    while let Some(newer) = queue.pop_front() {
+        current = newer;
+    }
+    current
 }
 
 /// Win32 wave-out playback without helper processes: instant and async.
@@ -397,6 +410,16 @@ mod tests {
         }
         assert_eq!(q.len(), 8);
         assert_eq!(q.iter().copied().collect::<Vec<_>>(), (12..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn keep_newest_returns_last_queued() {
+        use std::collections::VecDeque;
+        let mut q: VecDeque<i32> = VecDeque::from([2, 3, 4]);
+        assert_eq!(keep_newest(1, &mut q), 4);
+        assert!(q.is_empty());
+        let mut empty: VecDeque<i32> = VecDeque::new();
+        assert_eq!(keep_newest(7, &mut empty), 7);
     }
 
     #[test]

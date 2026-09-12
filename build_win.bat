@@ -63,7 +63,8 @@ python -c "from PIL import Image; im = Image.open('assets\\favico.png').convert(
 if errorlevel 1 (
     echo WARNING: Could not generate favico.ico; executables will use the default icon.
 ) else (
-    set "ICONFLAG=--icon dist\favico.ico"
+    rem Quoted inside the variable: project paths may contain spaces.
+    set "ICONFLAG=--icon "%CD%\dist\favico.ico""
 )
 
 echo.
@@ -89,7 +90,9 @@ echo [2/4] Building uninstall.exe (Python uninstaller, PyInstaller)...
 if not exist "dist\payload" mkdir "dist\payload"
 copy /Y "dist\bit-typing.exe" "dist\payload\bit-typing.exe" >nul
 if errorlevel 1 goto :failed
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name uninstall %ICONFLAG% --collect-all customtkinter --add-data "assets;assets" --distpath dist --workpath build\tmp --specpath build uninstall.py
+rem NOTE: --add-data sources must be absolute: PyInstaller resolves relative
+rem ones against --specpath, which would look for build\assets and fail.
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name uninstall %ICONFLAG% --collect-all customtkinter --add-data "%CD%\assets;assets" --distpath dist --workpath build\tmp --specpath build uninstall.py
 if errorlevel 1 goto :failed
 if not exist "dist\uninstall.exe" (
     echo ERROR: dist\uninstall.exe was not created.
@@ -101,7 +104,7 @@ if errorlevel 1 goto :failed
 echo.
 echo [3/4] Building bit-typing-setup.exe (Python installer, PyInstaller)...
 echo       Payload: executables plus assets, keyboards, courses, and lang.
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name bit-typing-setup %ICONFLAG% --collect-all customtkinter --add-data "dist\payload\bit-typing.exe;payload" --add-data "dist\payload\uninstall.exe;payload" --add-data "assets;assets" --add-data "keyboards;keyboards" --add-data "courses;courses" --add-data "lang;lang" --distpath dist --workpath build\tmp --specpath build installer.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name bit-typing-setup %ICONFLAG% --collect-all customtkinter --add-data "%CD%\dist\payload\bit-typing.exe;payload" --add-data "%CD%\dist\payload\uninstall.exe;payload" --add-data "%CD%\assets;assets" --add-data "%CD%\keyboards;keyboards" --add-data "%CD%\courses;courses" --add-data "%CD%\lang;lang" --distpath dist --workpath build\tmp --specpath build installer.py
 if errorlevel 1 goto :failed
 if not exist "dist\bit-typing-setup.exe" (
     echo ERROR: dist\bit-typing-setup.exe was not created.
