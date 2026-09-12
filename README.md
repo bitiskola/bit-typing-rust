@@ -1,21 +1,64 @@
-public Sourcecode of BIT Typing rust version
+# BIT Typing — Rust
 
-How to build:
+Public source code for **BIT Typing**, a Rust-based version of the application.
 
-windows:
-install rust & cargo
-install python3.11+
-run:
+## 🛠️ Building
+
+### Windows
+
+#### Requirements
+
+* [Rust & Cargo](https://www.rust-lang.org/tools/install)
+* [Python 3.11+](https://www.python.org/downloads/)
+
+#### 1. Install the Python dependencies
+
+```bash
 pip install customtkinter pillow pyinstaller pyinstaller-hooks-contrib
+```
 
-then run:
+#### 2. Run the Windows build script
+
+```bat
 ./build_win.bat
+```
 
-once the build finishes the output can be found in outputs/ folder
+Once the build finishes, the compiled output can be found in:
 
-linux:
-install rust & cargo
-run:
+```text
+outputs/
+```
+
+---
+
+### Linux
+
+#### Requirements
+
+* Rust & Cargo
+
+#### 1. Run the Linux build script
+
+```bash
 ./build_linux.sh
+```
 
-once the build finishes the output can be found in outputs/ folder
+Once the build finishes, the compiled output can be found in:
+
+```text
+outputs/
+```
+
+## 📁 Output
+
+Build artifacts for both platforms are placed in the `outputs/` directory.
+
+```text
+outputs/
+├── ...
+└── ...
+```
+
+## 📜 License
+
+See the repository's license file for details.
