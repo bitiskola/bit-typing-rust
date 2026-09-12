@@ -12,9 +12,12 @@
 //! chunk, like the Python mixer) so rapid keystrokes never sound swapped.
 
 use std::collections::VecDeque;
+#[cfg(not(target_os = "windows"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(target_os = "windows"))]
+use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -118,8 +121,17 @@ impl Drop for ClickPlayer {
 }
 
 fn run_loop(inner: Arc<Inner>) {
+    // Windows keeps one persistent wave-out stream: the open stream keeps
+    // sleepy (USB/Bluetooth) endpoints awake so short clicks are never
+    // swallowed cold, and overlapping clicks mix instead of cutting out.
+    #[cfg(target_os = "windows")]
+    {
+        run_wave_out(inner);
+        return;
+    }
     // Prefer a streaming raw mixer when pw-cat exists (lowest latency,
     // exact Python parity). Otherwise play whole files per event.
+    #[cfg(not(target_os = "windows"))]
     if pw_cat_available() {
         run_pw_cat_stream(inner);
     } else {
@@ -127,10 +139,12 @@ fn run_loop(inner: Arc<Inner>) {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn pw_cat_available() -> bool {
     which("pw-cat").is_some()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn run_pw_cat_stream(inner: Arc<Inner>) {
     let mut child = Command::new("pw-cat")
         .args([
@@ -205,25 +219,25 @@ fn run_pw_cat_stream(inner: Arc<Inner>) {
     }
 }
 
+/// Take the next click, blocking; drains anything stale behind it so only
+/// the freshest click ever plays (shared by every backend loop).
+fn take_newest(inner: &Inner) -> Option<QueuedClick> {
+    let mut guard = inner.queue.lock().unwrap();
+    let first = loop {
+        if *inner.stop.lock().unwrap() {
+            return None;
+        }
+        if let Some(click) = guard.pop_front() {
+            break click;
+        }
+        guard = inner.wake.wait(guard).unwrap();
+    };
+    Some(keep_newest(first, &mut guard))
+}
+
+#[cfg(not(target_os = "windows"))]
 fn run_per_event(inner: Arc<Inner>) {
-    loop {
-        // Wait for work, then keep only the freshest click: one-shot
-        // backends (and slow fallbacks) can never overlap or pile up, so a
-        // stall degrades to skipped stale clicks instead of minutes of late
-        // sounds followed by silence.
-        let click = {
-            let mut guard = inner.queue.lock().unwrap();
-            let first = loop {
-                if *inner.stop.lock().unwrap() {
-                    return;
-                }
-                if let Some(click) = guard.pop_front() {
-                    break click;
-                }
-                guard = inner.wake.wait(guard).unwrap();
-            };
-            keep_newest(first, &mut guard)
-        };
+    while let Some(click) = take_newest(&inner) {
         play_event_best_effort(&inner, &click);
     }
 }
@@ -236,58 +250,252 @@ fn keep_newest<T>(mut current: T, queue: &mut VecDeque<T>) -> T {
     current
 }
 
-/// Win32 wave-out playback without helper processes: instant and async.
-/// Falls back to a detached PowerShell one-shot when it fails.
+/// Win32 wave-out playback: one stream held open for the whole session.
+/// An open stream keeps sleepy (USB/Bluetooth) endpoints awake, so short
+/// clicks are never swallowed cold, and overlapping clicks mix instead of
+/// cutting each other out (single-voice `PlaySound` cannot do either).
 #[cfg(target_os = "windows")]
 mod win32 {
     #[allow(non_snake_case)]
     #[link(name = "winmm")]
     extern "system" {
-        pub fn PlaySoundW(
-            pszSound: *const u16,
-            hmod: *const std::ffi::c_void,
-            fdwSound: u32,
-        ) -> i32;
+        pub fn waveOutOpen(
+            phwo: *mut *mut std::ffi::c_void,
+            uDeviceID: u32,
+            pwfx: *const WaveFormatEx,
+            dwCallback: usize,
+            dwInstance: usize,
+            fdwOpen: u32,
+        ) -> u32;
+        pub fn waveOutPrepareHeader(
+            hwo: *const std::ffi::c_void,
+            pwh: *mut WaveHdr,
+            cbwh: u32,
+        ) -> u32;
+        pub fn waveOutWrite(
+            hwo: *const std::ffi::c_void,
+            pwh: *mut WaveHdr,
+            cbwh: u32,
+        ) -> u32;
+        pub fn waveOutUnprepareHeader(
+            hwo: *const std::ffi::c_void,
+            pwh: *mut WaveHdr,
+            cbwh: u32,
+        ) -> u32;
+        pub fn waveOutReset(hwo: *const std::ffi::c_void) -> u32;
+        pub fn waveOutClose(hwo: *const std::ffi::c_void) -> u32;
     }
 
-    pub const SND_FILENAME: u32 = 0x00020000;
-    pub const SND_ASYNC: u32 = 0x00000001;
+    pub const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
+    pub const WAVE_FORMAT_PCM: u16 = 1;
+    pub const CALLBACK_NULL: u32 = 0;
+    pub const MMSYSERR_NOERROR: u32 = 0;
 
-    /// Queue a wav file for async playback. Returns true when accepted.
-    pub fn play_wav_async(path: &std::path::Path) -> bool {
-        use std::os::windows::ffi::OsStrExt;
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        wide.push(0);
-        // SAFETY: PlaySoundW only reads the NUL-terminated file name during
-        // the call; winmm.dll is a core Windows system library.
-        unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null(), SND_FILENAME | SND_ASYNC) != 0 }
+    /// 22050 Hz mono 16-bit PCM descriptor (20 bytes on the wire).
+    /// Field names follow the Win32 API spelling.
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    pub struct WaveFormatEx {
+        pub wFormatTag: u16,
+        pub nChannels: u16,
+        pub nSamplesPerSec: u32,
+        pub nAvgBytesPerSec: u32,
+        pub nBlockAlign: u16,
+        pub wBitsPerSample: u16,
+        pub cbSize: u16,
     }
+
+    /// Wave header (48 bytes on 64-bit). The sample buffer lives in a
+    /// separate `Box<[i16]>`; both heap addresses stay stable for the
+    /// header's whole lifetime. Field names follow the Win32 API spelling.
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    pub struct WaveHdr {
+        pub lpData: *mut u8,
+        pub dwBufferLength: u32,
+        pub dwBytesRecorded: u32,
+        pub dwUser: usize,
+        pub dwFlags: u32,
+        pub dwLoops: u32,
+        pub lpNext: *mut u8,
+        pub reserved: usize,
+    }
+
+    /// One in-flight buffer: dropping it after a successful unprepare frees
+    /// both allocations. Boxes never move on the heap, so driver-held
+    /// pointers stay valid.
+    pub struct Inflight {
+        pub hdr: Box<WaveHdr>,
+        // Held alive for the header's lifetime (lpData points into it).
+        #[allow(dead_code)]
+        pub buf: Box<[i16]>,
+    }
+
+    /// Open wave device. `None` when no audio device exists.
+    pub struct WaveDevice {
+        handle: *mut std::ffi::c_void,
+        inflight: Vec<Inflight>,
+    }
+
+    // The handle is only touched on the audio thread.
+    unsafe impl Send for WaveDevice {}
+
+    impl WaveDevice {
+        pub fn open() -> Option<Self> {
+            let fmt = WaveFormatEx {
+                wFormatTag: WAVE_FORMAT_PCM,
+                nChannels: 1,
+                nSamplesPerSec: super::RATE,
+                nAvgBytesPerSec: super::RATE * 2,
+                nBlockAlign: 2,
+                wBitsPerSample: 16,
+                cbSize: 0,
+            };
+            let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: plain-old-data structs, valid params; winmm.dll is a
+            // core Windows system library. Synchronous open, no callback.
+            let rc = unsafe {
+                waveOutOpen(
+                    &mut handle,
+                    WAVE_MAPPER,
+                    &fmt,
+                    0,
+                    0,
+                    CALLBACK_NULL,
+                )
+            };
+            if rc != MMSYSERR_NOERROR || handle.is_null() {
+                return None;
+            }
+            Some(Self { handle, inflight: Vec::new() })
+        }
+
+        /// Queue samples for async mixed playback. Never blocks.
+        /// Returns false when the device rejected the buffer (unplugged?).
+        pub fn play(&mut self, samples: &[i16]) -> bool {
+            if samples.is_empty() {
+                return true;
+            }
+            self.sweep();
+            let mut buf: Box<[i16]> = samples.to_vec().into_boxed_slice();
+            let mut hdr = Box::new(WaveHdr {
+                lpData: buf.as_mut_ptr() as *mut u8,
+                dwBufferLength: (buf.len() * 2) as u32,
+                dwBytesRecorded: 0,
+                dwUser: 0,
+                dwFlags: 0,
+                dwLoops: 0,
+                lpNext: std::ptr::null_mut(),
+                reserved: 0,
+            });
+            // SAFETY: `hdr`/`buf` are heap-pinned for their whole lifetime;
+            // sizes match the descriptors exactly.
+            let ok = unsafe {
+                waveOutPrepareHeader(
+                    self.handle,
+                    hdr.as_mut() as *mut WaveHdr,
+                    std::mem::size_of::<WaveHdr>() as u32,
+                ) == MMSYSERR_NOERROR
+                    && waveOutWrite(
+                        self.handle,
+                        hdr.as_mut() as *mut WaveHdr,
+                        std::mem::size_of::<WaveHdr>() as u32,
+                    ) == MMSYSERR_NOERROR
+            };
+            if ok {
+                self.inflight.push(Inflight { hdr, buf });
+            }
+            // On failure the boxes simply drop (nothing was queued).
+            ok
+        }
+
+        /// Free finished buffers. Cheap: usually 0-2 headers in flight.
+        fn sweep(&mut self) {
+            let handle = self.handle;
+            self.inflight.retain(|slot| {
+                // SAFETY: same pinned pointers as at Write time.
+                let done = unsafe {
+                    waveOutUnprepareHeader(
+                        handle,
+                        slot.hdr.as_ref() as *const WaveHdr as *mut WaveHdr,
+                        std::mem::size_of::<WaveHdr>() as u32,
+                    )
+                };
+                done != MMSYSERR_NOERROR
+            });
+        }
+    }
+
+    impl Drop for WaveDevice {
+        fn drop(&mut self) {
+            unsafe {
+                waveOutReset(self.handle);
+                for slot in &self.inflight {
+                    waveOutUnprepareHeader(
+                        self.handle,
+                        slot.hdr.as_ref() as *const WaveHdr as *mut WaveHdr,
+                        std::mem::size_of::<WaveHdr>() as u32,
+                    );
+                }
+                waveOutClose(self.handle);
+            }
+        }
+    }
+}
+
+/// Windows playback loop: open the stream lazily on the first click (so a
+/// missing device costs nothing), then mix through it forever; without a
+/// device, or if it dies mid-session, fall back to detached PowerShell
+/// one-shots (audible, just higher latency).
+#[cfg(target_os = "windows")]
+fn run_wave_out(inner: Arc<Inner>) {
+    let mut device: Option<win32::WaveDevice> = None;
+    let mut wave_ok = true;
+    while let Some(click) = take_newest(&inner) {
+        if wave_ok {
+            if device.is_none() {
+                device = win32::WaveDevice::open();
+                wave_ok = device.is_some();
+            }
+            if let Some(dev) = device.as_mut() {
+                if dev.play(&click.samples) {
+                    continue;
+                }
+                // Device died: drop (closes) it and degrade gracefully.
+                device = None;
+                wave_ok = false;
+            }
+        }
+        powershell_play(&event_wav(&inner.key_wav, &inner.error_wav, click.correct).to_path_buf());
+    }
+}
+
+/// Detached PowerShell one-shot (never blocks keystrokes).
+#[cfg(target_os = "windows")]
+fn powershell_play(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(New-Object System.Media.SoundPlayer $args[0]).PlaySync()",
+        ])
+        .arg(path.as_os_str())
+        .creation_flags(0x08000000)
+        .spawn();
 }
 
 /// Play one queued click through the best backend. Fire-and-forget on every
 /// platform so keystrokes never block on audio. (The terminal bell at the
 /// end is unreachable on Windows, where the branch above always returns.)
-#[cfg_attr(target_os = "windows", allow(unreachable_code))]
+#[cfg(not(target_os = "windows"))]
 fn play_event_best_effort(inner: &Inner, click: &QueuedClick) {
     // Whole-file players so bundled wavs are honoured, with the correct
     // file per outcome. Every backend is fire-and-forget: keystrokes must
-    // never block on audio (the old blocking PlaySync made Windows sounds
-    // pile up seconds behind typing).
+    // never block on audio. (Windows uses its own persistent wave-out
+    // loop instead; see `run_wave_out`.)
     let wav = event_wav(&inner.key_wav, &inner.error_wav, click.correct).to_path_buf();
-    #[cfg(target_os = "windows")]
-    {
-        if win32::play_wav_async(&wav) {
-            return;
-        }
-        use std::os::windows::process::CommandExt;
-        let _ = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "(New-Object System.Media.SoundPlayer $args[0]).PlaySync()"])
-            .arg(wav.as_os_str())
-            .creation_flags(0x08000000)
-            .spawn();
-        return;
-    }
     #[cfg(target_os = "macos")]
     {
         if which("afplay").is_some() {
@@ -313,6 +521,7 @@ fn play_event_best_effort(inner: &Inner, click: &QueuedClick) {
     let _ = std::io::stdout().flush();
 }
 
+#[cfg(not(target_os = "windows"))]
 fn which(cmd: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
@@ -420,6 +629,15 @@ mod tests {
         assert!(q.is_empty());
         let mut empty: VecDeque<i32> = VecDeque::new();
         assert_eq!(keep_newest(7, &mut empty), 7);
+    }
+
+    /// Win32 ABI contract (Windows CI): WAVEFORMATEX is 20 bytes, WAVEHDR
+    /// is 48 bytes on 64-bit. A wrong field type would corrupt driver calls.
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+    #[test]
+    fn wave_struct_layout() {
+        assert_eq!(std::mem::size_of::<win32::WaveFormatEx>(), 20);
+        assert_eq!(std::mem::size_of::<win32::WaveHdr>(), 48);
     }
 
     #[test]
