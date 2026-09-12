@@ -31,6 +31,8 @@ struct Inner {
     stop: Mutex<bool>,
     key_wav: PathBuf,
     error_wav: PathBuf,
+    key_samples: Vec<i16>,
+    error_samples: Vec<i16>,
     enabled: Mutex<bool>,
 }
 
@@ -53,12 +55,19 @@ fn event_wav<'a>(key_wav: &'a Path, error_wav: &'a Path, correct: bool) -> &'a P
 
 impl ClickPlayer {
     pub fn new(sounds_dir: &Path) -> Self {
+        let key_wav = sounds_dir.join("key.wav");
+        let error_wav = sounds_dir.join("error.wav");
+        // Decode once: per-keystroke disk reads stutter on some systems.
+        let key_samples = read_wav_samples(&key_wav).unwrap_or_default();
+        let error_samples = read_wav_samples(&error_wav).unwrap_or_default();
         let inner = Arc::new(Inner {
             queue: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
             stop: Mutex::new(false),
-            key_wav: sounds_dir.join("key.wav"),
-            error_wav: sounds_dir.join("error.wav"),
+            key_wav,
+            error_wav,
+            key_samples,
+            error_samples,
             enabled: Mutex::new(true),
         });
         let worker = Arc::clone(&inner);
@@ -77,18 +86,28 @@ impl ClickPlayer {
         if !*self.inner.enabled.lock().unwrap() {
             return;
         }
-        let path = event_wav(&self.inner.key_wav, &self.inner.error_wav, correct).to_path_buf();
-        let samples = read_wav_samples(&path).unwrap_or_default();
+        let samples = if correct {
+            self.inner.key_samples.clone()
+        } else {
+            self.inner.error_samples.clone()
+        };
         if samples.is_empty() {
             return;
         }
-        self.inner
-            .queue
-            .lock()
-            .unwrap()
-            .push_back(QueuedClick { samples, correct });
+        let mut queue = self.inner.queue.lock().unwrap();
+        push_capped(&mut queue, QueuedClick { samples, correct }, 8);
+        drop(queue);
         self.inner.wake.notify_one();
     }
+}
+
+/// Bounded queue: fresh clicks evict stale ones, so a stalled backend can
+/// never pile up minutes of late sounds — feedback stays real-time.
+fn push_capped<T>(queue: &mut VecDeque<T>, item: T, cap: usize) {
+    while queue.len() >= cap.max(1) {
+        queue.pop_front();
+    }
+    queue.push_back(item);
 }
 
 impl Drop for ClickPlayer {
@@ -367,6 +386,17 @@ mod tests {
         let err = Path::new("/s/error.wav");
         assert_eq!(event_wav(key, err, true), key);
         assert_eq!(event_wav(key, err, false), err);
+    }
+
+    #[test]
+    fn queue_cap_drops_oldest_keeps_newest() {
+        use std::collections::VecDeque;
+        let mut q: VecDeque<i32> = VecDeque::new();
+        for i in 0..20 {
+            push_capped(&mut q, i, 8);
+        }
+        assert_eq!(q.len(), 8);
+        assert_eq!(q.iter().copied().collect::<Vec<_>>(), (12..20).collect::<Vec<_>>());
     }
 
     #[test]

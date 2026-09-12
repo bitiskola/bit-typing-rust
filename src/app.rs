@@ -1243,18 +1243,31 @@ impl BitTypingApp {
             0.0
         };
         let after_w = ui.ctx().fonts(|f| f.layout_job(after.clone()).size().x);
+        // Absolute prefix width from the lesson start. The 240-cell window
+        // keeps the view count flat, but positioning MUST use absolute
+        // coordinates: once the window fills and slides, the windowed
+        // `before` width goes constant (monospace) and all motion would
+        // freeze mid-lesson. Absolute coordinates keep the text flowing on
+        // every keystroke from the first character to the last.
+        let mut abs_job = egui::text::LayoutJob::default();
+        for i in 0..active.min(count) {
+            abs_job.append(&display_char(chars[i]), 0.0, mono44.clone());
+        }
+        let abs_before_w = ui.ctx().fonts(|f| f.layout_job(abs_job).size().x);
+        // Offset of the window start in absolute coordinates.
+        let lead_fill = (abs_before_w - before_w).max(0.0);
         // Active cell metrics (Swift CharacterCell: h7/v4 padding, radius 10).
         let line_h = ui
             .ctx()
             .fonts(|f| f.row_height(&egui::FontId::monospace(44.0)));
         let active_w = if has_active { active_char_w + 14.0 } else { 0.0 };
         let cell_h = line_h + 8.0;
-        let content_w = before_w + active_w + after_w;
+        let content_w = lead_fill + before_w + active_w + after_w;
         // Finished lesson: keep focus on the last character.
         let anchor_cx = if has_active {
-            before_w + active_w * 0.5
+            abs_before_w + active_w * 0.5
         } else {
-            before_w
+            abs_before_w
         };
         // Glide toward the pinned position (~0.12s ease-out, Swift
         // `withAnimation`); idle frames sit exactly on target.
@@ -1289,6 +1302,11 @@ impl BitTypingApp {
         );
         row.set_clip_rect(region.intersect(saved_clip));
         row.spacing_mut().item_spacing.x = 0.0;
+        // Absolute offset of the window start: positions the windowed run at
+        // its lesson-absolute coordinates so motion never freezes.
+        if lead_fill > 0.0 {
+            row.add_space(lead_fill);
+        }
         row.label(before);
         if has_active {
             // Active cell painted directly (Swift CharacterCell background):
@@ -3820,6 +3838,63 @@ mod tests {
             render(&mut app, &ctx);
         }
         assert!(!app.text_animating, "glide must finish after typing stops");
+    }
+
+    /// Animation trajectory over 150 keystrokes (crossing the 80-char window
+    /// slide): every settled shift must advance monotonically by roughly one
+    /// character, and no single frame may teleport — catches any regime
+    /// change where the motion visibly switches character mid-lesson.
+    #[test]
+    fn lesson_glide_trajectory_stable() {
+        let (_tmp, mut app) = harness_app();
+        app.current_lesson = "01".to_string();
+        app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
+        app.start_session();
+        let ctx = egui::Context::default();
+        let frame = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 850.0),
+            )),
+            ..Default::default()
+        };
+        let render = |app: &mut BitTypingApp, ctx: &egui::Context| {
+            let full = ctx.run(frame(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.lesson_page(ui));
+            });
+            let _ = ctx.tessellate(full.shapes, full.pixels_per_point);
+        };
+        render(&mut app, &ctx);
+        let mut settled = Vec::new();
+        let mut prev_rendered = app.text_shift;
+        for step in 0..150 {
+            let before = app.session.index;
+            let expected = app.session.text[before];
+            app.handle_char_input(expected);
+            render(&mut app, &ctx);
+            let delta = (app.text_shift - prev_rendered).abs();
+            assert!(
+                delta < 120.0,
+                "step {step}: frame jump {delta:.1}px (teleport?)"
+            );
+            assert!(
+                app.text_shift.is_finite(),
+                "step {step}: shift went non-finite"
+            );
+            prev_rendered = app.text_shift;
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            // Let this switch land, then record the settled position.
+            render(&mut app, &ctx);
+            settled.push(app.text_shift);
+        }
+        assert!(!app.text_animating, "must settle after typing stops");
+        for w in settled.windows(2) {
+            let d = w[1] - w[0];
+            assert!(
+                d > 5.0 && d < 60.0,
+                "settled steps must advance ~one char monotonically, got {d:.1}"
+            );
+        }
     }
 
     /// Lesson chrome aligns at fullscreen size (headless shape analysis):

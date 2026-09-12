@@ -51,6 +51,10 @@ cargo test --release
 if errorlevel 1 goto :failed
 
 if not exist "dist" mkdir "dist"
+rem PyInstaller work/spec dirs must exist upfront, otherwise it fails
+rem with "no such file or directory".
+if not exist "build\tmp" mkdir "build\tmp"
+if errorlevel 1 goto :failed
 
 echo.
 echo Generating EXE icon from assets\favico.png...
@@ -84,6 +88,7 @@ echo.
 echo [2/4] Building uninstall.exe (Python uninstaller, PyInstaller)...
 if not exist "dist\payload" mkdir "dist\payload"
 copy /Y "dist\bit-typing.exe" "dist\payload\bit-typing.exe" >nul
+if errorlevel 1 goto :failed
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name uninstall %ICONFLAG% --collect-all customtkinter --add-data "assets;assets" --distpath dist --workpath build\tmp --specpath build uninstall.py
 if errorlevel 1 goto :failed
 if not exist "dist\uninstall.exe" (
@@ -106,6 +111,7 @@ if not exist "dist\bit-typing-setup.exe" (
 echo.
 echo [4/4] Staging portable files and outputs...
 copy /Y "dist\bit-typing.exe" "dist\payload\bit-typing.exe" >nul
+if errorlevel 1 goto :failed
 xcopy /E /I /Y "assets" "dist\assets\" >nul
 if errorlevel 1 goto :failed
 xcopy /E /I /Y "keyboards" "dist\keyboards\" >nul

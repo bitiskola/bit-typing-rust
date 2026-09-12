@@ -1,4 +1,10 @@
 //! `bit-typing` entry point: native egui window.
+//!
+//! On Windows the GUI subsystem is used so double-clicking the exe does not
+//! open an extra console window (output still works when launched from a
+//! terminal, e.g. `--version` or `--verify-resources`).
+
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use bit_typing::app::BitTypingApp;
 
