@@ -229,7 +229,9 @@ fn leading_number(stem: &str) -> Option<u64> {
     }
 }
 
-/// SHA-256 inventory over the three default groups (for `verify` tooling).
+/// SHA-256 inventory over the default groups (for `verify` tooling).
+/// courses/ is optional (lessons ship via git course packs); lang and
+/// keyboards are always inventoried when present.
 pub fn inventory(project: &Path) -> BTreeMap<String, String> {
     use sha2::{Digest, Sha256};
     let mut files = BTreeMap::new();

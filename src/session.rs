@@ -362,6 +362,9 @@ impl Session {
             text: text_string,
             states,
             strokes: self.strokes.clone(),
+            unfinished: false,
+            course_id: String::new(),
+            fixed_indices: self.fixed_indices.iter().copied().collect(),
         }
     }
 }

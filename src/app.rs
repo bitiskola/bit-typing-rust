@@ -17,14 +17,15 @@ use egui::{Align, Color32, Layout, RichText};
 
 use crate::audio::{self, ClickPlayer};
 use crate::courses::{
-    self, BUILTIN_COURSE_FILES, load_custom_courses, next_lesson, read_course_text,
+    self, BUILTIN_COURSE_FILES, load_custom_courses, read_course_text,
     sanitise_lesson_name,
 };
 use crate::history::{Attempt, load_history, save_history};
 use crate::i18n::I18n;
 use crate::keyboards::{KeyboardLayout, load_layouts};
 use crate::paths;
-use crate::session::{CharacterOutcome, Clock, Session, SystemClock, Tip, overall_score};
+use crate::repos::{self, AvailableCourse};
+use crate::session::{CharacterOutcome, CharState, Clock, Session, SystemClock, Tip, overall_score};
 use crate::settings::{Settings, TYPO_MODES};
 use crate::theme::{self, FingerZone};
 
@@ -33,6 +34,7 @@ enum Page {
     Lesson,
     Stats,
     Editor,
+    Repos,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,12 +56,20 @@ pub struct BitTypingApp {
     settings: Settings,
     i18n: I18n,
     layouts: BTreeMap<String, KeyboardLayout>,
-    course_paths: Vec<PathBuf>,
     custom: BTreeSet<String>,
     history: Vec<Attempt>,
     session: Session,
-    current_lesson: String,
-    last_lesson_name: String,
+    /// Repo-aware lesson list, filtered by the active keyboard layout
+    /// (local `courses/*.txt` + every repo pack matching the layout).
+    available: Vec<AvailableCourse>,
+    /// Stable id of the selected course (`local:<stem>` / `repo:...`).
+    current_id: String,
+    last_course_id: String,
+    /// Course pack URLs (`data/course_repos.json`, default always present).
+    repos: Vec<String>,
+    /// When continuing an unfinished attempt, its history index. Finishing
+    /// updates that row in place instead of pushing a new one.
+    continuing_from: Option<usize>,
     page: Page,
     sidebar_collapsed: bool,
     // Lesson text glide: the pinned shift eases toward its target for
@@ -98,6 +108,10 @@ pub struct BitTypingApp {
     // Setup shares the options form.
     confirm_replace: Option<PathBuf>,
     pending_imports: Vec<PathBuf>,
+    // Course repos (sidebar page + add-url popup).
+    new_repo_url: String,
+    repo_status: String,
+    show_add_repo: bool,
     // Misc
     audio: ClickPlayer,
     clock: SystemClock,
@@ -118,22 +132,30 @@ impl BitTypingApp {
         let settings = Settings::load(&paths::settings_file(&root));
         let i18n = I18n::load(&paths::langs_dir(&root));
         let layouts = load_layouts(&paths::keyboards_dir(&root));
-        let course_paths = courses::list_courses(&paths::courses_dir(&root));
         let custom = load_custom_courses(&paths::custom_courses_file(&root));
         let history = load_history(&paths::history_file(&root));
+        let repos = repos::load_repo_urls(&paths::repos_file(&root));
+        // Auto-refresh every pack on startup so lessons are available
+        // locally (best effort: offline failures keep the last copy).
+        let _ = repos::refresh_all(&root, &repos);
+        let available = repos::collect_available_courses(
+            &root,
+            &repos,
+            &settings.keyboard_layout,
+            &custom,
+        );
 
-        let current_lesson = course_paths
-            .first()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().to_string())
+        let current_id = available.first().map(|c| c.id.clone()).unwrap_or_default();
+        let initial_course = available.iter().find(|c| c.id == current_id);
+        let text = initial_course
+            .map(|c| {
+                read_course_text(&c.path)
+                    .map(|t| t.trim_end_matches(['\r', '\n']).to_string())
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
-        let text = current_lesson
-            .is_empty()
-            .then(String::new)
-            .unwrap_or_else(|| {
-                lesson_text(&root, &course_paths, &current_lesson, "Choose a lesson")
-            });
-        let mut session = Session::new(&current_lesson, &text);
+        let lesson_title = initial_course.map(|c| c.title.clone()).unwrap_or_default();
+        let mut session = Session::new(&lesson_title, &text);
         session.tip = Tip::Initial;
 
         let audio = ClickPlayer::new(&paths::sounds_dir(&root));
@@ -173,12 +195,14 @@ impl BitTypingApp {
             settings,
             i18n,
             layouts,
-            course_paths,
             custom,
             history,
             session,
-            current_lesson: current_lesson.clone(),
-            last_lesson_name: current_lesson,
+            available,
+            current_id: current_id.clone(),
+            last_course_id: current_id,
+            repos,
+            continuing_from: None,
             page: Page::Lesson,
             sidebar_collapsed: false,
             text_shift: 0.0,
@@ -199,6 +223,9 @@ impl BitTypingApp {
             confirm_clear_history: false,
             confirm_replace: None,
             pending_imports: Vec::new(),
+            new_repo_url: String::new(),
+            repo_status: String::new(),
+            show_add_repo: false,
             audio,
             clock: SystemClock::default(),
             save_error: String::new(),
@@ -263,35 +290,42 @@ impl BitTypingApp {
         )
     }
 
-    fn reload_courses(&mut self, select: Option<&str>) {
-        self.course_paths = courses::list_courses(&paths::courses_dir(&self.root));
-        let names: Vec<String> = self
-            .course_paths
-            .iter()
-            .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string())
-            .collect();
+    fn current_course(&self) -> Option<AvailableCourse> {
+        self.available.iter().find(|c| c.id == self.current_id).cloned()
+    }
+
+    fn refresh_available(&mut self, select: Option<&str>) {
+        self.available = repos::collect_available_courses(
+            &self.root,
+            &self.repos,
+            &self.settings.keyboard_layout,
+            &self.custom,
+        );
         if let Some(sel) = select {
-            if names.contains(&sel.to_string()) {
-                self.current_lesson = sel.to_string();
+            if self.available.iter().any(|c| c.id == sel) {
+                self.current_id = sel.to_string();
+            } else if let Some(found) = self.available.iter().find(|c| c.title == sel).cloned() {
+                // Backward compat: callers passing a bare lesson title.
+                self.current_id = found.id;
             }
         }
-        if !names.contains(&self.current_lesson) {
-            self.current_lesson = names.first().cloned().unwrap_or_default();
+        if !self.available.iter().any(|c| c.id == self.current_id) {
+            self.current_id = self.available.first().map(|c| c.id.clone()).unwrap_or_default();
         }
-        self.prepare_lesson();
     }
 
     fn current_path(&self) -> Option<PathBuf> {
-        self.course_paths.iter().find(|p| {
-            p.file_stem().map(|s| s.to_string_lossy().to_string()) == Some(self.current_lesson.clone())
-        }).cloned()
+        self.current_course().map(|c| c.path)
     }
 
     fn prepare_lesson(&mut self) {
-        let path = self.current_path();
+        // Starting (or re-selecting) a lesson always drops a continued run:
+        // a fresh start must record a new history row on finish.
+        self.continuing_from = None;
+        let course = self.current_course();
         let fallback = self.t("initial_tip");
-        let text = match &path {
-            Some(p) => match read_course_text(p) {
+        let text = match &course {
+            Some(c) => match read_course_text(&c.path) {
                 Ok(t) => t.trim_end_matches(['\r', '\n']).to_string(),
                 Err(e) => {
                     self.save_error =
@@ -301,15 +335,24 @@ impl BitTypingApp {
             },
             None => fallback.clone(),
         };
-        if let Some(p) = &path {
-            self.last_lesson_name = p
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+        if let Some(c) = &course {
+            self.last_course_id = c.id.clone();
         }
-        self.session = Session::new(&self.current_lesson, &text);
+        let title = course.map(|c| c.title).unwrap_or_default();
+        self.session = Session::new(&title, &text);
         self.session.tip = Tip::Ready;
+        self.text_shift = 0.0;
+        self.text_animating = false;
+    }
+
+    /// Pause an in-progress lesson before a modal sheet steals the frame.
+    /// Opening Options/About must never reset (or silently time) the run.
+    fn auto_pause_for_modal(&mut self) {
+        if self.session.running && !self.session.paused {
+            self.session.paused_at = self.clock.now();
+            self.session.paused = true;
+            self.session.tip = Tip::Paused;
+        }
     }
 
     fn start_session(&mut self) {
@@ -338,28 +381,125 @@ impl BitTypingApp {
     }
 
     fn finish_session(&mut self) {
+        self.finish_session_inner(false);
+    }
+
+    /// Finish the lesson early (before the last character). Shows the same
+    /// results sheet and stores an `unfinished` row that can be continued
+    /// from the statistics page.
+    fn finish_session_early(&mut self) {
+        if !self.session.running || self.session.paused {
+            // Allow finishing while paused too: unpause the clock first so
+            // the stored duration excludes the modal/idle gap.
+            if !(self.session.running && self.session.index > 0) {
+                return;
+            }
+        }
+        if self.session.index == 0 || self.session.index >= self.session.text.len() {
+            return;
+        }
+        self.finish_session_inner(true);
+    }
+
+    fn finish_session_inner(&mut self, early: bool) {
         if !self.session.running {
             return;
         }
         self.session.running = false;
-        let path = self.current_path();
-        let course_file = path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let custom = path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| self.custom.contains(&n.to_string_lossy().to_string()))
-            .unwrap_or(false);
-        let attempt =
+        let course = self.current_course();
+        // When continuing an orphaned attempt (repo removed), fall back to
+        // the stored identifiers so history stays consistent.
+        let (course_file, custom, course_id, lesson) = match &course {
+            Some(c) => (c.course_file.clone(), c.custom, c.id.clone(), c.title.clone()),
+            None => {
+                if let Some(idx) = self.continuing_from.and_then(|i| self.history.get(i)) {
+                    (idx.course_file.clone(), idx.custom_course, idx.course_id.clone(), idx.lesson.clone())
+                } else {
+                    (String::new(), false, String::new(), self.session.lesson.clone())
+                }
+            }
+        };
+        let mut attempt =
             self.session
                 .finish(&self.settings, &self.clock, &course_file, custom);
+        attempt.lesson = if lesson.is_empty() { attempt.lesson } else { lesson };
+        attempt.course_id = course_id;
+        // `Session::finish` already fills `fixed_indices`; `unfinished` only
+        // for manual early exits with real progress left.
+        attempt.unfinished = early && attempt.done < 99.9 && !attempt.text.is_empty();
+        if let Some(idx) = self.continuing_from {
+            if idx < self.history.len() {
+                // Keep the original start time; the restored session already
+                // carried it over.
+                self.history[idx] = attempt.clone();
+                let _ = save_history(&paths::history_file(&self.root), &self.history);
+                if !attempt.unfinished {
+                    self.continuing_from = None;
+                }
+                self.well_done_until = Some(Instant::now() + std::time::Duration::from_secs(3));
+                self.pending_results = Some(attempt);
+                return;
+            }
+            self.continuing_from = None;
+        }
         self.history.push(attempt.clone());
         let _ = save_history(&paths::history_file(&self.root), &self.history);
         self.well_done_until = Some(Instant::now() + std::time::Duration::from_secs(3));
         self.pending_results = Some(attempt);
+    }
+
+    /// Rebuild a live session from an unfinished attempt and let the user
+    /// type the rest. The history row is updated in place on finish.
+    fn continue_attempt(&mut self, idx: usize) {
+        let Some(attempt) = self.history.get(idx).cloned() else { return };
+        // Prefer the live course file; fall back to the stored transcript so
+        // removed/renamed packs can still be finished.
+        let live = self.available.iter().find(|c| c.id == attempt.course_id).cloned()
+            .or_else(|| {
+                self.available.iter().find(|c| {
+                    c.course_file == attempt.course_file && c.title == attempt.lesson
+                }).cloned()
+            });
+        let text: Vec<char> = attempt.text.chars().collect();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(c) = &live {
+            self.current_id = c.id.clone();
+            self.last_course_id = c.id.clone();
+        }
+        let now = self.clock.now();
+        let mut sess = Session::new(&attempt.lesson, &attempt.text);
+        sess.index = attempt.characters.min(text.len());
+        sess.states = attempt
+            .states
+            .iter()
+            .filter_map(|(k, v)| k.parse::<usize>().ok().map(|i| (i, CharState::from_str(v))))
+            .collect();
+        sess.strokes = attempt.strokes.clone();
+        sess.errors = attempt.errors;
+        sess.timeouts = attempt.timeouts;
+        sess.backspaces = attempt.backspaces;
+        let normal = sess.strokes.iter().filter(|s| !s.system_key).count();
+        let correct = sess.strokes.iter().filter(|s| !s.system_key && s.correct).count();
+        sess.typed_keys = normal;
+        sess.correct_keys = correct;
+        sess.fixed_indices = attempt.fixed_indices.iter().copied().collect();
+        sess.pending_wrong = false;
+        sess.started_wall = attempt.started_at.clone();
+        // Accumulate time: the stored duration is the offset, new typing adds.
+        sess.started = Some(now - attempt.duration.max(0.0));
+        sess.paused_total = 0.0;
+        sess.last_key = now;
+        sess.running = true;
+        sess.paused = false;
+        sess.tip = Tip::Resumed;
+        self.session = sess;
+        self.continuing_from = Some(idx);
+        self.results = None;
+        self.page = Page::Lesson;
+        self.text_shift = 0.0;
+        self.text_animating = false;
     }
 
     fn sync_options_form(&mut self) {
@@ -378,6 +518,10 @@ impl BitTypingApp {
     }
 
     /// Validate + apply the options form. Returns success.
+    /// NOTE: saving options must never restart the lesson (previously every
+    /// save called `prepare_lesson`, wiping in-progress runs). The course
+    /// list is only rebuilt when the keyboard filter actually changed, and
+    /// the live session is preserved whenever the current course survives.
     fn apply_options_form(&mut self) -> bool {
         let goal_wpm: f64 = match self.opt_goal_wpm.trim().parse::<f64>() {
             Ok(v) => v.max(1.0),
@@ -411,8 +555,17 @@ impl BitTypingApp {
         self.settings.metronome = self.opt_metronome;
         self.audio.set_enabled(self.settings.sound);
         self.save_settings();
-        // Re-translate dynamic UI (lesson tip etc.).
-        self.prepare_lesson();
+        // Refresh the layout-filtered course list, but keep the live typing
+        // session untouched when the current course is still available.
+        let prev_id = self.current_id.clone();
+        self.refresh_available(None);
+        if !self.available.iter().any(|c| c.id == prev_id) {
+            // Current pack vanished under the new filter: pick the first and
+            // only then restart the lesson.
+            self.prepare_lesson();
+        } else {
+            self.current_id = prev_id;
+        }
         true
     }
 
@@ -425,6 +578,270 @@ impl BitTypingApp {
         false
     }
 
+    // --- Course repositories ------------------------------------------------
+
+    fn save_repos(&self) {
+        let _ = repos::save_repo_urls(&paths::repos_file(&self.root), &self.repos);
+    }
+
+    fn add_repo(&mut self, url: &str) {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            self.repo_status = self.t("repo_empty_url");
+            return;
+        }
+        if self.repos.iter().any(|u| u.eq_ignore_ascii_case(&url)) {
+            self.repo_status = self.t("repo_already_added");
+            return;
+        }
+        match repos::refresh_repo(&paths::repos_dir(&self.root), &url) {
+            Ok(details) => {
+                self.repos.push(url.clone());
+                self.save_repos();
+                self.refresh_available(Some(&self.current_id.clone()));
+                let shown = if details.name.is_empty() { url } else { details.name };
+                self.repo_status = self.t("repo_added").replace("{name}", &shown);
+                self.new_repo_url.clear();
+            }
+            Err(e) => {
+                self.repo_status = format!("{}: {e}", self.t("repo_add_failed"));
+            }
+        }
+    }
+
+    fn remove_repo(&mut self, url: &str) {
+        if repos::is_default_repo(url) {
+            self.repo_status = self.t("repo_default_locked");
+            return;
+        }
+        self.repos.retain(|u| u != url);
+        // Drop the local checkout so stale lessons vanish from the selector.
+        let dir = repos::repo_dir_for_url(&paths::repos_dir(&self.root), url);
+        let _ = std::fs::remove_dir_all(&dir);
+        self.save_repos();
+        let current = self.current_id.clone();
+        self.refresh_available(None);
+        if !self.available.iter().any(|c| c.id == current) {
+            self.prepare_lesson();
+        } else {
+            self.current_id = current;
+        }
+        self.repo_status = self.t("repo_removed").replace("{name}", url);
+    }
+
+    fn refresh_repos(&mut self) {
+        let results = repos::refresh_all(&self.root, &self.repos);
+        let mut ok = 0;
+        let mut first_err = String::new();
+        for (_, r) in &results {
+            match r {
+                Ok(_) => ok += 1,
+                Err(e) if first_err.is_empty() => first_err = e.clone(),
+                _ => {}
+            }
+        }
+        let current = self.current_id.clone();
+        self.refresh_available(None);
+        if !self.available.iter().any(|c| c.id == current) {
+            self.prepare_lesson();
+        } else {
+            self.current_id = current;
+        }
+        self.repo_status = if first_err.is_empty() {
+            self.t("repo_refreshed").replace("{count}", &ok.to_string())
+        } else {
+            format!("{}: {first_err}", self.t("repo_refresh_partial"))
+        };
+    }
+
+    /// Course packs page (sidebar tab): list every repo with remove,
+    /// refresh-all in the toolbar, and a popup to add new repo URLs.
+    /// Packs are git checkouts under `repos/`; the default pack can never
+    /// be removed. Refreshing re-reads `details.json` and rebuilds the
+    /// lesson picker (filtered by the active keyboard layout).
+    fn repos_page(&mut self, ui: &mut egui::Ui) {
+        let dark = self.dark(ui.ctx());
+        let title = self.t("course_repos");
+        let tip = self.t("course_repos_tip");
+        let remove_label = self.t("remove");
+        let locked_label = self.t("repo_default_locked");
+        // Explicit column like the other pages: `available_height` inside
+        // auto-sized nesting reads back ~0, so measure once at panel level.
+        let top_w = ui.available_width();
+        let top_h = ui.available_height();
+        let column_w = (top_w - 24.0).max(100.0);
+        let left_pad = ((top_w - column_w) / 2.0).max(0.0);
+        ui.add_space(4.0);
+        let mut remove: Option<String> = None;
+        ui.horizontal(|ui| {
+            ui.add_space(left_pad);
+            ui.allocate_ui_with_layout(
+                egui::vec2(column_w, (top_h - 4.0).max(100.0)),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .size(22.0)
+                            .strong()
+                            .color(theme::ink(dark)),
+                    );
+                    ui.label(
+                        RichText::new(tip)
+                            .size(13.0)
+                            .color(theme::muted(dark)),
+                    );
+                    ui.add_space(8.0);
+                    let urls = self.repos.clone();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            theme::card_frame(dark).show(ui, |ui| {
+                                for url in &urls {
+                                    let is_default = repos::is_default_repo(url);
+                                    let slug = repos::slug_for_url(url);
+                                    let detail_name = repos::load_details(
+                                        &paths::repos_dir(&self.root).join(&slug),
+                                    )
+                                    .map(|d| d.name)
+                                    .unwrap_or_default();
+                                    let name = if detail_name.is_empty() {
+                                        format!("{slug} — {url}")
+                                    } else {
+                                        format!("{detail_name} ({slug})")
+                                    };
+                                    let row_remove = remove_label.clone();
+                                    let row_locked = locked_label.clone();
+                                    let row_remove2 = remove_label.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{}{}",
+                                                if is_default { "★ " } else { "" },
+                                                name
+                                            ))
+                                            .size(13.0)
+                                            .strong()
+                                            .color(theme::ink(dark)),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        !is_default,
+                                                        theme::secondary_button(
+                                                            RichText::new(format!(
+                                                                "🗑 {row_remove}"
+                                                            ))
+                                                            .size(12.0),
+                                                            dark,
+                                                        ),
+                                                    )
+                                                    .on_hover_text(if is_default {
+                                                        row_locked
+                                                    } else {
+                                                        row_remove2
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    remove = Some(url.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.label(
+                                        RichText::new(url.clone())
+                                            .size(12.0)
+                                            .color(theme::muted(dark)),
+                                    );
+                                    ui.separator();
+                                }
+                            });
+                        });
+                },
+            );
+            ui.add_space(12.0);
+        });
+        if let Some(url) = remove {
+            self.remove_repo(&url);
+        }
+    }
+
+    /// Popup to add a course repo by URL (opened from the Repos toolbar).
+    /// Closes on success (`add_repo` clears the field then); failures stay
+    /// open with the reason shown.
+    fn add_repo_dialog(&mut self, ctx: &egui::Context) {
+        let dark = self.dark(ctx);
+        let mut open = self.show_add_repo;
+        let mut add = false;
+        let mut cancel = false;
+        let title = self.t("add_repo");
+        let hint = self.t("repo_url_hint");
+        let add_label = format!("+ {}", self.t("add_repo"));
+        let cancel_label = self.t("cancel");
+        let status = self.repo_status.clone();
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_repo_url)
+                        .hint_text(hint)
+                        .desired_width(380.0),
+                );
+                if !status.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(status)
+                            .size(12.0)
+                            .color(theme::muted(dark)),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(theme::brand_button(
+                                RichText::new(add_label).size(13.0),
+                                dark,
+                            ))
+                            .clicked()
+                        {
+                            add = true;
+                        }
+                        if ui
+                            .add(theme::secondary_button(
+                                RichText::new(cancel_label).size(13.0),
+                                dark,
+                            ))
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        if add {
+            let url = self.new_repo_url.clone();
+            self.add_repo(&url);
+            if self.new_repo_url.is_empty() {
+                // Success: the field was cleared, dismiss the popup.
+                self.show_add_repo = false;
+                return;
+            }
+            // Failure: keep the popup open with the reason shown.
+            self.show_add_repo = true;
+            return;
+        }
+        if cancel {
+            self.new_repo_url.clear();
+        }
+        self.show_add_repo = open && !cancel;
+    }
+
     /// The lesson owns every keystroke: a focused button turns Space/Enter
     /// into a fake click (egui `FAKE_PRIMARY_CLICKED`), so clicking Start
     /// would pause the lesson again at the first space instead of typing
@@ -435,6 +852,7 @@ impl BitTypingApp {
             || self.show_options
             || self.show_setup
             || self.show_about
+            || self.show_add_repo
             || self.well_done_until.is_some()
         {
             return;
@@ -489,6 +907,7 @@ impl BitTypingApp {
             || self.show_options
             || self.show_setup
             || self.show_about
+            || self.show_add_repo
             || self.well_done_until.is_some()
             || self.page != Page::Lesson
         {
@@ -561,15 +980,6 @@ impl BitTypingApp {
             self.begin_text_anim();
         }
     }
-}
-
-fn lesson_text(_root: &Path, paths: &[PathBuf], stem: &str, fallback: &str) -> String {
-    paths
-        .iter()
-        .find(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()) == Some(stem.to_string()))
-        .and_then(|p| read_course_text(p).ok())
-        .map(|t| t.trim_end_matches(['\r', '\n']).to_string())
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn trim_num(v: f64) -> String {
@@ -662,7 +1072,12 @@ impl eframe::App for BitTypingApp {
             Page::Lesson => self.lesson_page(ui),
             Page::Stats => self.stats_page(ui),
             Page::Editor => self.editor_page(ui),
+            Page::Repos => self.repos_page(ui),
         });
+
+        if self.show_add_repo {
+            self.add_repo_dialog(ctx);
+        }
 
         if self.show_setup {
             self.setup_window(ctx);
@@ -747,6 +1162,7 @@ impl BitTypingApp {
                         Page::Lesson => self.lesson_toolbar(ui, dark, consumed),
                         Page::Stats => self.stats_toolbar(ui, dark),
                         Page::Editor => self.editor_toolbar(ui, dark),
+                        Page::Repos => self.repos_toolbar(ui, dark),
                     }
                 });
             });
@@ -755,13 +1171,8 @@ impl BitTypingApp {
     fn lesson_toolbar(&mut self, ui: &mut egui::Ui, dark: bool, consumed: f32) {
         // `consumed` = exact width the toolbar used before us (toggle row).
         let entry_avail = ui.available_width();
-        // Lesson picker pill (navigation placement in Swift).
-        let names: Vec<String> = self
-            .course_paths
-            .iter()
-            .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string())
-            .collect();
-        if names.is_empty() {
+        // Lesson picker pill: repo-aware, filtered by keyboard layout.
+        if self.available.is_empty() {
             ui.label(
                 RichText::new(self.t("no_lessons"))
                     .size(13.0)
@@ -777,14 +1188,24 @@ impl BitTypingApp {
                 visuals.hovered.corner_radius = egui::CornerRadius::same(16);
                 visuals.open.bg_fill = theme::panel2(dark);
                 visuals.open.corner_radius = egui::CornerRadius::same(16);
-                let selected = self.current_lesson.clone();
+                let selected_label = self
+                    .current_course()
+                    .map(|c| c.display())
+                    .unwrap_or_default();
+                // Clone the list for the borrow checker: the combo mutates
+                // `current_id` while iterating.
+                let options: Vec<(String, String)> = self
+                    .available
+                    .iter()
+                    .map(|c| (c.id.clone(), c.display()))
+                    .collect();
                 egui::ComboBox::from_id_salt("lesson_combo")
-                    .selected_text(format!("{selected}  ↕"))
-                    .width(220.0)
+                    .selected_text(format!("{selected_label}  ↕"))
+                    .width(260.0)
                     .show_ui(ui, |ui| {
-                        for name in &names {
+                        for (id, label) in &options {
                             if ui
-                                .selectable_value(&mut self.current_lesson, name.clone(), name)
+                                .selectable_value(&mut self.current_id, id.clone(), label)
                                 .clicked()
                             {
                                 self.prepare_lesson();
@@ -883,6 +1304,26 @@ impl BitTypingApp {
                 self.confirm_clear_history = true;
             }
             ui.add_space(4.0);
+            let selected_unfinished = self
+                .stats_selected
+                .and_then(|i| self.history.get(i))
+                .map(|a| a.unfinished)
+                .unwrap_or(false);
+            if selected_unfinished {
+                if ui
+                    .add(theme::brand_button(
+                        RichText::new(format!("▶ {}", self.t("continue_lesson"))).size(13.0),
+                        dark,
+                    ))
+                    .clicked()
+                {
+                    if let Some(idx) = self.stats_selected {
+                        self.stats_selected = None;
+                        self.continue_attempt(idx);
+                    }
+                }
+                ui.add_space(4.0);
+            }
             let can_review = self.stats_selected.is_some();
             if ui
                 .add_enabled(
@@ -901,6 +1342,38 @@ impl BitTypingApp {
                         self.results = Some(attempt);
                     }
                 }
+            }
+        });
+    }
+
+    fn repos_toolbar(&mut self, ui: &mut egui::Ui, dark: bool) {
+        if ui
+            .add(theme::brand_button(
+                RichText::new(format!("+ {}", self.t("add_repo"))).size(13.0),
+                dark,
+            ))
+            .clicked()
+        {
+            self.new_repo_url.clear();
+            self.repo_status.clear();
+            self.show_add_repo = true;
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add(theme::secondary_button(
+                    RichText::new(format!("⟳ {}", self.t("refresh_all"))).size(13.0),
+                    dark,
+                ))
+                .clicked()
+            {
+                self.refresh_repos();
+            }
+            if !self.repo_status.is_empty() {
+                ui.label(
+                    RichText::new(self.repo_status.clone())
+                        .size(12.0)
+                        .color(theme::muted(dark)),
+                );
             }
         });
     }
@@ -978,6 +1451,7 @@ impl BitTypingApp {
                         (Page::Lesson, "⌨", self.t("current_lesson")),
                         (Page::Stats, "📊", self.t("student_statistics")),
                         (Page::Editor, "📝", self.t("lesson_editor")),
+                        (Page::Repos, "📦", self.t("course_repos")),
                     ];
                     for (page, icon, label) in items {
                         let active = self.page == page;
@@ -1025,6 +1499,8 @@ impl BitTypingApp {
                             )
                             .clicked()
                         {
+                            // Opening About must not wipe the live lesson.
+                            self.auto_pause_for_modal();
                             self.show_about = true;
                         }
                         ui.add_space(4.0);
@@ -1038,7 +1514,10 @@ impl BitTypingApp {
                             )
                             .clicked()
                         {
+                            // Opening Options must not wipe the live lesson.
+                            self.auto_pause_for_modal();
                             self.sync_options_form();
+                            self.repo_status.clear();
                             self.show_options = true;
                         }
                     });
@@ -1490,7 +1969,11 @@ impl BitTypingApp {
         ui.add_space(12.0);
     }
 
-    fn lesson_footer(&self, ui: &mut egui::Ui, dark: bool) {
+    fn lesson_footer(&mut self, ui: &mut egui::Ui, dark: bool) {
+        let can_finish_early = self.session.running
+            && self.session.index > 0
+            && self.session.index < self.session.text.len();
+        let mut finish_early = false;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let progress = if self.session.text.is_empty() {
                 0.0
@@ -1512,8 +1995,32 @@ impl BitTypingApp {
                 .size(13.0)
                 .color(theme::muted(dark)),
             );
+            if can_finish_early {
+                ui.add_space(12.0);
+                if ui
+                    .add(theme::secondary_button(
+                        RichText::new(format!("■ {}", self.t("finish_early"))).size(12.0),
+                        dark,
+                    ))
+                    .on_hover_text(self.t("finish_early_tip"))
+                    .clicked()
+                {
+                    finish_early = true;
+                }
+            }
         });
+        // Left-aligned continuation hint when resuming an unfinished run.
+        if self.continuing_from.is_some() {
+            ui.label(
+                RichText::new(format!("↩ {}", self.t("continuing_unfinished")))
+                    .size(12.0)
+                    .color(theme::muted(dark)),
+            );
+        }
         ui.set_min_height(30.0);
+        if finish_early {
+            self.finish_session_early();
+        }
     }
 }
 
@@ -1887,9 +2394,16 @@ impl BitTypingApp {
                                     let done = format!("{:.0}%", attempt.done);
                                     let errs = format!("{}", attempt.errors);
                                     let date = attempt.finished_at.replace('T', " ");
+                                    // Unfinished rows carry a ⏸ marker so they
+                                    // stand out and invite continuation.
+                                    let lesson_label: String = if attempt.unfinished {
+                                        format!("⏸ {}", attempt.lesson)
+                                    } else {
+                                        attempt.lesson.clone()
+                                    };
                                     let cells = [
                                         date.as_str(),
-                                        attempt.lesson.as_str(),
+                                        lesson_label.as_str(),
                                         speed.as_str(),
                                         acc.as_str(),
                                         done.as_str(),
@@ -1897,9 +2411,14 @@ impl BitTypingApp {
                                     ];
                                     stats_row_cells(ui, row_rect, cells, 13.0, theme::ink(dark));
                                     if resp.double_clicked() {
-                                        self.results_tab = ResultsTab::Overview;
-                                        self.chart_metric = ChartMetric::Speed;
-                                        self.results = Some(attempt.clone());
+                                        if attempt.unfinished {
+                                            self.stats_selected = None;
+                                            self.continue_attempt(idx);
+                                        } else {
+                                            self.results_tab = ResultsTab::Overview;
+                                            self.chart_metric = ChartMetric::Speed;
+                                            self.results = Some(attempt.clone());
+                                        }
                                     } else if resp.clicked() {
                                         self.stats_selected = Some(idx);
                                     }
@@ -1962,13 +2481,9 @@ impl BitTypingApp {
 
 impl BitTypingApp {
     fn load_editor_from_current(&mut self) {
-        if let Some(path) = self.current_path() {
-            self.editor_name = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            self.editor_text = read_course_text(&path).unwrap_or_default();
+        if let Some(course) = self.current_course() {
+            self.editor_name = course.title;
+            self.editor_text = read_course_text(&course.path).unwrap_or_default();
         }
     }
 
@@ -2029,8 +2544,8 @@ impl BitTypingApp {
             return;
         }
         let path = paths::courses_dir(&self.root).join(format!("{safe}.txt"));
-        let current = self.current_path().map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_default();
-        if path.exists() && path.file_stem().map(|s| s.to_string_lossy().to_string()) != Some(current.clone()) {
+        let current_title = self.current_course().map(|c| c.title).unwrap_or_default();
+        if path.exists() && path.file_stem().map(|s| s.to_string_lossy().to_string()) != Some(current_title.clone()) {
             self.confirm_replace = Some(path);
             return;
         }
@@ -2050,8 +2565,13 @@ impl BitTypingApp {
                     &self.custom,
                 );
             }
+            // Local ids are `local:<stem>`; select the saved lesson by title.
             let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            self.reload_courses(Some(&stem));
+            self.refresh_available(None);
+            if let Some(found) = self.available.iter().find(|c| c.title == stem && c.repo_name.is_empty()).cloned() {
+                self.current_id = found.id;
+            }
+            self.prepare_lesson();
         }
     }
 
@@ -2123,8 +2643,15 @@ impl BitTypingApp {
             &paths::custom_courses_file(&self.root),
             &self.custom,
         );
-        // Import is silent on overwrite; the lesson list simply refreshes.
-        self.reload_courses(last.as_deref());
+        // Import is silent on overwrite; the lesson list simply refreshes and
+        // the fresh lesson becomes current (an explicit user action, so the
+        // session restarts on purpose —unlike Options/About).
+        self.refresh_available(last.as_deref());
+        if last.is_some() {
+            self.prepare_lesson();
+        } else if self.current_course().is_none() {
+            self.prepare_lesson();
+        }
         if to_editor {
             self.page = Page::Editor;
             self.load_editor_from_current();
@@ -2844,28 +3371,46 @@ impl BitTypingApp {
             attempt.slowdown,
             self.settings.goal_wpm,
         );
-        let next = next_lesson(
-            &self.course_paths,
-            &self.custom,
-            &attempt.course_file,
-            &attempt.lesson,
-            attempt.custom_course,
-        );
+        // Repo-aware successor inside the same pack+layout. Unfinished runs
+        // never offer *Next*: the user should continue this lesson first.
+        let next: Option<AvailableCourse> = if attempt.unfinished {
+            None
+        } else {
+            let id = if attempt.course_id.is_empty() {
+                self.available
+                    .iter()
+                    .find(|c| c.course_file == attempt.course_file && c.title == attempt.lesson)
+                    .map(|c| c.id.clone())
+                    .unwrap_or_default()
+            } else {
+                attempt.course_id.clone()
+            };
+            repos::next_course(&self.available, &id)
+        };
         let mut open = true;
         let mut go_home = false;
-        let mut go_next: Option<PathBuf> = None;
+        let mut go_next: Option<AvailableCourse> = None;
+        let mut go_continue: Option<usize> = None;
+        // Bigger sheet so gauges + tabs + details are all visible without
+        // cramped inner scrolling (was 760x620 with a 240px box).
         egui::Window::new("")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .title_bar(false)
-            .default_size([760.0, 620.0])
+            .default_size([880.0, 760.0])
+            .min_size([760.0, 620.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 // Header: title left, score + stars right.
                 ui.horizontal(|ui| {
+                    let title = if attempt.unfinished {
+                        format!("{} ({})", self.t("lesson_results"), self.t("unfinished"))
+                    } else {
+                        self.t("lesson_results")
+                    };
                     ui.label(
-                        RichText::new(self.t("lesson_results"))
+                        RichText::new(title)
                             .size(24.0)
                             .strong()
                             .color(theme::ink(dark)),
@@ -2881,6 +3426,13 @@ impl BitTypingApp {
                         );
                     });
                 });
+                if attempt.unfinished {
+                    ui.label(
+                        RichText::new(self.t("results_unfinished_note"))
+                            .size(13.0)
+                            .color(theme::muted(dark)),
+                    );
+                }
                 ui.add_space(6.0);
                 // Gauges card: overall in brand blue, the rest monochrome ink.
                 theme::card_frame(dark).show(ui, |ui| {
@@ -2972,7 +3524,7 @@ impl BitTypingApp {
                 });
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
-                    .max_height(240.0)
+                    .max_height(360.0)
                     .show(ui, |ui| match self.results_tab {
                         ResultsTab::Overview => self.results_overview(ui, &attempt, dark),
                         ResultsTab::Details => self.results_details(ui, &attempt, dark),
@@ -2981,7 +3533,7 @@ impl BitTypingApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(next_path) = next.clone() {
+                        if let Some(next_course) = next.clone() {
                             if ui
                                 .add(theme::brand_button(
                                     RichText::new(format!("➡ {}", self.t("next_lesson"))).size(13.0),
@@ -2989,9 +3541,30 @@ impl BitTypingApp {
                                 ))
                                 .clicked()
                             {
-                                go_next = Some(next_path);
+                                go_next = Some(next_course);
                             }
                             ui.add_space(6.0);
+                        }
+                        if attempt.unfinished {
+                            // Find the stored row so Continue updates it in place.
+                            let stored = self.history.iter().rposition(|a| {
+                                a.started_at == attempt.started_at
+                                    && a.lesson == attempt.lesson
+                                    && a.course_id == attempt.course_id
+                                    && a.unfinished
+                            });
+                            if let Some(idx) = stored {
+                                if ui
+                                    .add(theme::brand_button(
+                                        RichText::new(format!("▶ {}", self.t("continue_lesson"))).size(13.0),
+                                        dark,
+                                    ))
+                                    .clicked()
+                                {
+                                    go_continue = Some(idx);
+                                }
+                                ui.add_space(6.0);
+                            }
                         }
                         if ui
                             .add(theme::secondary_button(
@@ -3005,17 +3578,15 @@ impl BitTypingApp {
                     });
                 });
             });
-        if go_home {
+        if let Some(idx) = go_continue {
+            self.results = None;
+            self.continue_attempt(idx);
+        } else if go_home {
             self.results = None;
             self.return_to_lesson();
-        } else if let Some(next_path) = go_next {
+        } else if let Some(next_course) = go_next {
             self.results = None;
-            if let Some(stem) = next_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-            {
-                self.current_lesson = stem;
-            }
+            self.current_id = next_course.id;
             self.page = Page::Lesson;
             self.prepare_lesson();
         } else if !open {
@@ -3025,13 +3596,8 @@ impl BitTypingApp {
     }
 
     fn return_to_lesson(&mut self) {
-        let names: Vec<String> = self
-            .course_paths
-            .iter()
-            .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string())
-            .collect();
-        if names.contains(&self.last_lesson_name) {
-            self.current_lesson = self.last_lesson_name.clone();
+        if self.available.iter().any(|c| c.id == self.last_course_id) {
+            self.current_id = self.last_course_id.clone();
         }
         self.page = Page::Lesson;
         self.prepare_lesson();
@@ -3039,7 +3605,9 @@ impl BitTypingApp {
 
     fn results_overview(&self, ui: &mut egui::Ui, attempt: &Attempt, dark: bool) {
         theme::card_frame(dark).show(ui, |ui| {
-            ui.vertical(|ui| {
+            // Full-width card with centered text (matches the Details tab).
+            ui.set_min_width(ui.available_width());
+            ui.vertical_centered_justified(|ui| {
                 let verdict = if attempt.passed {
                     self.t("passed_tip")
                 } else {
@@ -3124,19 +3692,49 @@ impl BitTypingApp {
 
     fn results_errors(&self, ui: &mut egui::Ui, attempt: &Attempt, dark: bool) {
         theme::card_frame(dark).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (color, key) in [
-                        (theme::ink(dark), "legend_correct"),
-                        (theme::muted(dark), "legend_slow"),
-                        (theme::error(dark), "legend_error"),
-                        (theme::error_timeout(dark), "legend_error_slow"),
-                    ] {
-                        ui.label(RichText::new("●").monospace().color(color));
-                        ui.label(RichText::new(self.t(key)).size(13.0).color(theme::ink(dark)));
-                        ui.add_space(12.0);
+            // Full-width card with centered text (matches the Details tab).
+            ui.set_min_width(ui.available_width());
+            ui.vertical_centered_justified(|ui| {
+                // Legend as one centered, wrapping run: dot + label pairs.
+                let mut legend = egui::text::LayoutJob::default();
+                let items = [
+                    (theme::ink(dark), "legend_correct"),
+                    (theme::muted(dark), "legend_slow"),
+                    (theme::error(dark), "legend_error"),
+                    (theme::error_timeout(dark), "legend_error_slow"),
+                ];
+                for (i, (color, key)) in items.iter().enumerate() {
+                    if i > 0 {
+                        legend.append(
+                            "      ",
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(13.0),
+                                color: theme::ink(dark),
+                                ..Default::default()
+                            },
+                        );
                     }
-                });
+                    legend.append(
+                        "●",
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(13.0),
+                            color: *color,
+                            ..Default::default()
+                        },
+                    );
+                    legend.append(
+                        &format!(" {}", self.t(key)),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(13.0),
+                            color: theme::ink(dark),
+                            ..Default::default()
+                        },
+                    );
+                }
+                ui.label(legend);
                 ui.add_space(6.0);
                 // Coloured transcript: ink / muted / reds (Swift parity).
                 let mut job = egui::text::LayoutJob::default();
@@ -3448,12 +4046,14 @@ mod tests {
             settings,
             i18n: I18n::load(&root.join("lang")),
             layouts: BTreeMap::new(),
-            course_paths: Vec::new(),
             custom: BTreeSet::new(),
             history: Vec::new(),
             session: Session::new("", ""),
-            current_lesson: String::new(),
-            last_lesson_name: String::new(),
+            available: Vec::new(),
+            current_id: String::new(),
+            last_course_id: String::new(),
+            repos: vec![repos::DEFAULT_REPO_URL.to_string()],
+            continuing_from: None,
             page: Page::Lesson,
             sidebar_collapsed: false,
             text_shift: 0.0,
@@ -3474,6 +4074,9 @@ mod tests {
             confirm_clear_history: false,
             confirm_replace: None,
             pending_imports: Vec::new(),
+            new_repo_url: String::new(),
+            repo_status: String::new(),
+            show_add_repo: false,
             audio,
             clock: SystemClock::default(),
             save_error: String::new(),
@@ -3499,7 +4102,7 @@ mod tests {
     #[test]
     fn results_flow_renders_headless() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", "ab cd ef gh ij");
         app.start_session();
         // Include an error + a backspace so error/timeout paths are covered.
@@ -3563,7 +4166,7 @@ mod tests {
         let full = ctx.run(raw, |ctx| app.well_done_overlay(ctx));
         let _ = ctx.tessellate(full.shapes, full.pixels_per_point);
         app.results = None;
-        for page in [Page::Lesson, Page::Stats, Page::Editor] {
+        for page in [Page::Lesson, Page::Stats, Page::Editor, Page::Repos] {
             app.page = page;
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -3579,6 +4182,7 @@ mod tests {
                     Page::Lesson => app.lesson_page(ui),
                     Page::Stats => app.stats_page(ui),
                     Page::Editor => app.editor_page(ui),
+                    Page::Repos => app.repos_page(ui),
                 });
             });
             let _ = ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -3716,7 +4320,7 @@ mod tests {
     #[test]
     fn lesson_types_despite_button_focus() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", "keke");
         app.start_session();
         let ctx = egui::Context::default();
@@ -3745,7 +4349,7 @@ mod tests {
     #[test]
     fn lesson_glide_animates_and_settles() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
         app.start_session();
         let ctx = egui::Context::default();
@@ -3799,7 +4403,7 @@ mod tests {
     #[test]
     fn lesson_glide_fires_every_keystroke() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
         app.start_session();
         let ctx = egui::Context::default();
@@ -3847,7 +4451,7 @@ mod tests {
     #[test]
     fn lesson_glide_trajectory_stable() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
         app.start_session();
         let ctx = egui::Context::default();
@@ -3904,7 +4508,7 @@ mod tests {
     #[test]
     fn lesson_chrome_aligns_fullscreen() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
         // The harness ships no layouts; inject a Hungarian-shaped board.
         app.layouts.insert(
@@ -3974,10 +4578,13 @@ mod tests {
                     continue;
                 }
                 // Keycaps: right of the sidebar, below the toolbar, key-sized.
+                // Footer (finish-early button) sits near the bottom: exclude
+                // it by capping the top so only the keyboard block counts.
                 if fills.contains(&rs.fill)
                     && (20.0..=50.0).contains(&h)
                     && rs.rect.left() > 300.0
                     && rs.rect.top() > 400.0
+                    && rs.rect.top() < 970.0
                 {
                     left = left.min(rs.rect.left());
                     right = right.max(rs.rect.right());
@@ -4085,8 +4692,16 @@ mod tests {
     fn chrome_lesson_toolbar_pills() {
         let (_tmp, mut app) = harness_app();
         // A selectable lesson keeps Start enabled (brand circle painted).
-        app.course_paths = vec![std::path::PathBuf::from("01.txt")];
-        app.current_lesson = "01".to_string();
+        app.available = vec![AvailableCourse {
+            id: "local:01".to_string(),
+            title: "01".to_string(),
+            repo_name: String::new(),
+            layout: "*".to_string(),
+            path: std::path::PathBuf::from("01.txt"),
+            course_file: "01.txt".to_string(),
+            custom: false,
+        }];
+        app.current_id = "local:01".to_string();
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let dark = ctx.style().visuals.dark_mode;
@@ -4157,7 +4772,7 @@ mod tests {
             ..Default::default()
         };
         let mut tops = Vec::new();
-        for page in [Page::Lesson, Page::Stats, Page::Editor] {
+        for page in [Page::Lesson, Page::Stats, Page::Editor, Page::Repos] {
             app.page = page;
             let mut panel_top = None;
             for _ in 0..2 {
@@ -4168,6 +4783,7 @@ mod tests {
                         Page::Lesson => app.lesson_page(ui),
                         Page::Stats => app.stats_page(ui),
                         Page::Editor => app.editor_page(ui),
+                        Page::Repos => app.repos_page(ui),
                     });
                 });
                 let _ = ctx.tessellate(full.shapes.clone(), full.pixels_per_point);
@@ -4195,6 +4811,53 @@ mod tests {
         );
     }
 
+    /// Repos page renders headless (toolbar, list, add-url popup) without
+    /// panicking; empty/duplicate URLs are rejected without closing the flow.
+    #[test]
+    fn repos_page_renders_headless() {
+        let (_tmp, mut app) = harness_app();
+        app.page = Page::Repos;
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let frame = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 850.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let full = ctx.run(frame(), |ctx| {
+                app.toolbar(ctx);
+                app.side_bar(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.repos_page(ui));
+            });
+            let _ = ctx.tessellate(full.shapes.clone(), full.pixels_per_point);
+        }
+        // Validation keeps the popup flow open with a reason shown.
+        app.show_add_repo = true;
+        app.new_repo_url.clear();
+        app.add_repo("");
+        assert!(!app.repo_status.is_empty());
+        assert_eq!(app.repos.len(), 1);
+        let dup = app.repos[0].clone();
+        app.add_repo(&dup);
+        assert!(!app.repo_status.is_empty());
+        assert_eq!(app.repos.len(), 1);
+        // Popup + page render with the status visible.
+        let full = ctx.run(frame(), |ctx| app.add_repo_dialog(ctx));
+        let _ = ctx.tessellate(full.shapes.clone(), full.pixels_per_point);
+        assert!(app.show_add_repo);
+        app.show_add_repo = false;
+        let full = ctx.run(frame(), |ctx| {
+            app.toolbar(ctx);
+            app.side_bar(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.repos_page(ui));
+        });
+        let _ = ctx.tessellate(full.shapes.clone(), full.pixels_per_point);
+        assert!(!app.show_add_repo);
+    }
+
     /// Imported files land in the course list; editor imports also jump to
     /// the editor with the new lesson loaded. (The native picker itself is
     /// exercised by hand — it needs a display server.)
@@ -4211,7 +4874,7 @@ mod tests {
         assert!(courses.join("incoming.txt").is_file());
         assert!(app.custom.contains("incoming.txt"));
         assert_eq!(app.page, Page::Lesson);
-        assert_eq!(app.current_lesson, "incoming");
+        assert_eq!(app.current_course().map(|c| c.title).unwrap_or_default(), "incoming");
         // Editor import: jumps to the editor with the text loaded.
         std::fs::write(&src, "second version").unwrap();
         app.pending_imports = vec![src.clone()];
@@ -4234,7 +4897,7 @@ mod tests {
     #[test]
     fn results_chart_scrolls_sideways() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", "abcdefghijklmnopqr");
         app.start_session();
         while app.session.index < app.session.text.len() {
@@ -4379,7 +5042,7 @@ mod tests {
     #[test]
     fn lesson_page_renders_at_sizes() {
         let (_tmp, mut app) = harness_app();
-        app.current_lesson = "01".to_string();
+        app.current_id = "local:01".to_string();
         app.session = Session::new("01", &"ab cd ef gh ij kl mn ".repeat(20));
         app.start_session();
         for _ in 0..120 {
@@ -4402,5 +5065,92 @@ mod tests {
             });
             let _ = ctx.tessellate(full.shapes, full.pixels_per_point);
         }
+    }
+
+    /// Saving Options must not restart the lesson (regression: every save
+    /// used to call `prepare_lesson`, wiping in-progress runs).
+    #[test]
+    fn options_save_preserves_lesson_progress() {
+        let (_tmp, mut app) = harness_app();
+        // Real file on disk so `refresh_available` (called by apply) keeps
+        // the course alive; otherwise the list would legitimately reset.
+        let courses = crate::paths::courses_dir(&app.root);
+        std::fs::create_dir_all(&courses).unwrap();
+        std::fs::write(courses.join("01.txt"), "hello world, typing test").unwrap();
+        app.refresh_available(Some("local:01"));
+        assert_eq!(app.current_id, "local:01");
+        app.session = Session::new("01", "hello world, typing test");
+        app.start_session();
+        app.handle_char_input('h');
+        app.handle_char_input('e');
+        assert_eq!(app.session.index, 2);
+        app.sync_options_form();
+        assert!(app.apply_options_form());
+        assert_eq!(app.session.index, 2, "options save must not reset progress");
+        assert_eq!(app.session.text.iter().collect::<String>(), "hello world, typing test");
+        assert!(app.session.running, "session must keep running");
+    }
+
+    /// Opening Options/About pauses (so the clock stops) but never resets.
+    #[test]
+    fn modal_open_pauses_without_reset() {
+        let (_tmp, mut app) = harness_app();
+        app.session = Session::new("01", "hello world");
+        app.start_session();
+        app.handle_char_input('h');
+        assert_eq!(app.session.index, 1);
+        app.auto_pause_for_modal();
+        assert!(app.session.running);
+        assert!(app.session.paused);
+        assert_eq!(app.session.index, 1, "pause must not reset progress");
+    }
+
+    /// Finish-early stores an unfinished row; continuing it and typing the
+    /// rest updates the same row instead of pushing a new one.
+    #[test]
+    fn finish_early_and_continue_updates_row() {
+        let (_tmp, mut app) = harness_app();
+        app.available = vec![AvailableCourse {
+            id: "local:abc".to_string(),
+            title: "abc".to_string(),
+            repo_name: String::new(),
+            layout: "*".to_string(),
+            path: std::path::PathBuf::from("abc.txt"),
+            course_file: "abc.txt".to_string(),
+            custom: false,
+        }];
+        app.current_id = "local:abc".to_string();
+        app.session = Session::new("abc", "abcdef");
+        app.start_session();
+        app.handle_char_input('a');
+        app.handle_char_input('b');
+        assert_eq!(app.session.index, 2);
+        app.finish_session_early();
+        assert_eq!(app.history.len(), 1);
+        assert!(app.history[0].unfinished, "early finish must mark unfinished");
+        assert!(app.history[0].done < 100.0);
+        assert_eq!(app.history[0].characters, 2);
+        // Continue and finish the rest.
+        app.continue_attempt(0);
+        assert_eq!(app.session.index, 2);
+        assert!(app.session.running);
+        assert_eq!(app.continuing_from, Some(0));
+        for ch in ['c', 'd', 'e', 'f'] {
+            app.handle_char_input(ch);
+        }
+        assert_eq!(app.history.len(), 1, "continued finish must update in place");
+        assert!(!app.history[0].unfinished);
+        assert_eq!(app.history[0].characters, 6);
+        assert!((app.history[0].done - 100.0).abs() < 1e-6);
+    }
+
+    /// The default pack is always present and recognised as locked.
+    #[test]
+    fn default_repo_present_and_locked() {
+        assert!(repos::is_default_repo(repos::DEFAULT_REPO_URL));
+        assert!(repos::is_default_repo(&format!("{}.git", repos::DEFAULT_REPO_URL)));
+        let tmp = tempfile::tempdir().unwrap();
+        let urls = repos::load_repo_urls(&tmp.path().join("missing.json"));
+        assert!(urls.iter().any(|u| repos::is_default_repo(u)));
     }
 }

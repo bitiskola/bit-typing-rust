@@ -1,6 +1,6 @@
 [package]
 name = "bit-typing"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Modern typing practice application (Rust port of bit-typing)"
 license = "MIT"
@@ -13,14 +13,6 @@ categories = ["education", "gui"]
 [[bin]]
 name = "bit-typing"
 path = "src/main.rs"
-
-[[bin]]
-name = "bit-typing-setup"
-path = "src/bin/bit-typing-setup.rs"
-
-[[bin]]
-name = "bit-typing-uninstall"
-path = "src/bin/bit-typing-uninstall.rs"
 
 [lib]
 name = "bit_typing"

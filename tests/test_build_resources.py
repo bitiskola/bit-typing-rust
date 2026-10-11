@@ -69,8 +69,8 @@ class BuildResourceTests(unittest.TestCase):
         self.assertEqual(inventory(self.project), self.expected)
 
     def test_every_default_group_must_be_nonempty(self):
+        # lang/keyboards are bundled; courses are optional (git course packs).
         for directory, pattern in (
-            ("courses", "*.txt"),
             ("lang", "*.json"),
             ("keyboards", "*.json"),
         ):
@@ -94,6 +94,15 @@ class BuildResourceTests(unittest.TestCase):
         language.parent.rmdir()
         with self.assertRaises(ValueError):
             inventory(self.project)
+
+    def test_empty_courses_dir_is_allowed(self):
+        # Course packs come from git repos: zero bundled courses is valid.
+        for path in (self.project / "courses").glob("*.txt"):
+            path.unlink()
+        result = inventory(self.project)
+        self.assertNotIn("courses/01.txt", result)
+        self.assertIn("lang/EN-us.json", result)
+        self.assertIn("keyboards/US-qwerty.json", result)
 
     def test_inventory_does_not_collect_userdata_or_unrelated_files(self):
         unrelated = (

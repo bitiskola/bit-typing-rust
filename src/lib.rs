@@ -10,6 +10,7 @@ pub mod history;
 pub mod i18n;
 pub mod keyboards;
 pub mod paths;
+pub mod repos;
 pub mod session;
 pub mod settings;
 pub mod theme;
@@ -18,7 +19,7 @@ pub use paths::{APP_NAME, APP_VERSION, APP_WEBSITE};
 
 use rust_embed::RustEmbed;
 
-/// Compile-time embedded defaults, mirroring PyInstaller's `_MEIPASS` bundle.
+/// Compile-time embedded defaults (shipped inside the binary).
 ///
 /// At runtime [`paths::ensure_dirs`] copies these into the writable
 /// [`paths::runtime_root`] without overwriting user edits.

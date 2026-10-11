@@ -42,6 +42,17 @@ pub struct Attempt {
     pub text: String,
     pub states: HashMap<String, String>,
     pub strokes: Vec<Stroke>,
+    /// True when the user finished early (quit before typing everything).
+    /// Such rows can be continued later; finishing updates this row in place.
+    #[serde(default)]
+    pub unfinished: bool,
+    /// Stable course id (`local:<stem>` / `repo:<slug>:<layout>:<stem>`) so a
+    /// continued attempt can find its lesson again.
+    #[serde(default)]
+    pub course_id: String,
+    /// Fixed (Backspace-repaired) indices, restored when continuing.
+    #[serde(default)]
+    pub fixed_indices: Vec<usize>,
 }
 
 impl Attempt {

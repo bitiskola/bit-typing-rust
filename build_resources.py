@@ -9,16 +9,20 @@ import tempfile
 
 
 MANIFEST = "default-resources.json"
-GROUPS = (("courses", "*.txt"), ("lang", "*.json"), ("keyboards", "*.json"))
+# Courses are optional: lessons ship via git course packs (details.json),
+# not the app bundle. lang/keyboards stay required.
+GROUPS = (("courses", "*.txt", False), ("lang", "*.json", True), ("keyboards", "*.json", True))
 
 
 def inventory(project: Path) -> dict[str, str]:
     project = project.resolve()
     files = {}
-    for folder, pattern in GROUPS:
+    for folder, pattern, required in GROUPS:
         sources = sorted(path for path in (project / folder).glob(pattern) if path.is_file())
         if not sources:
-            raise ValueError(f"No default {folder}/{pattern} files in {project}. Build from the complete source folder.")
+            if required:
+                raise ValueError(f"No default {folder}/{pattern} files in {project}. Build from the complete source folder.")
+            continue
         for source in sources:
             files[source.relative_to(project).as_posix()] = hashlib.sha256(source.read_bytes()).hexdigest()
     return files
@@ -32,7 +36,7 @@ def pyinstaller_data(project: Path) -> list[tuple[str, str]]:
     generated.write_text(json.dumps({"version": 1, "files": files}, indent=2), encoding="utf-8")
     data = [(str(project / name), str(Path(name).parent)) for name in files]
     data.append((str(generated), "."))
-    print(f"Bundling {len(files)} default courses, languages, and keyboard layouts.")
+    print(f"Bundling {len(files)} default resource files (courses come from repos, not the bundle).")
     return data
 
 

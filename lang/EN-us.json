@@ -45,6 +45,16 @@
     "setup_welcome": "Welcome to bit-typing!", "setup_intro": "Let’s personalize your typing experience before the first lesson.",
     "setup_language_heading": "Language and keyboard", "setup_preferences_heading": "Practice preferences",
     "setup_change_later": "You can change all of these later in Options.", "finish_setup": "Finish setup",
-    "history_summary": "{count} attempts     Best speed  {best:.1f} {unit}     Average accuracy  {accuracy:.1f}%"
+    "history_summary": "{count} attempts     Best speed  {best:.1f} {unit}     Average accuracy  {accuracy:.1f}%",
+    "course_repos": "Course repositories", "course_repos_tip": "Lesson packs are loaded from git repositories and filtered by the active keyboard layout. ★ marks the built-in pack.",
+    "remove": "Remove", "repo_url_hint": "https://github.com/…/courses.git", "add_repo": "Add repo", "refresh_all": "Refresh all",
+    "repo_empty_url": "Enter a repository URL first.", "repo_already_added": "This repository is already added.",
+    "repo_added": "Added {name}.", "repo_add_failed": "Could not add repository",
+    "repo_default_locked": "The built-in course pack cannot be removed.", "repo_removed": "Removed {name}.",
+    "repo_refreshed": "Refreshed {count} pack(s).", "repo_refresh_partial": "Some packs could not be refreshed",
+    "finish_early": "Finish early", "finish_early_tip": "Stop now and save the partial result; you can continue it later from Statistics.",
+    "continuing_unfinished": "Continuing an unfinished run — finishing updates the same row.",
+    "continue_lesson": "Continue", "unfinished": "unfinished",
+    "results_unfinished_note": "Finished early — find this row in Statistics and press Continue to type the rest."
   }
 }

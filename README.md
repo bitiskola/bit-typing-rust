@@ -9,19 +9,19 @@ Public source code for **BIT Typing**, a Rust-based version of the application.
 #### Requirements
 
 * [Rust & Cargo](https://www.rust-lang.org/tools/install)
-* [Python 3.11+](https://www.python.org/downloads/)
+* [NSIS 3](https://nsis.sourceforge.io/) (`makensis` must be on `PATH`)
 
-#### 1. Install the Python dependencies
-
-```bash
-pip install customtkinter pillow pyinstaller pyinstaller-hooks-contrib
-```
-
-#### 2. Run the Windows build script
+#### 1. Run the Windows build script
 
 ```bat
-./build_win.bat
+./build_win.bat [version]
 ```
+
+The optional version defaults to the `Cargo.toml` version and must match it.
+The script runs the test suite, builds `bit-typing.exe` (with the embedded
+`assets/favico.ico` icon), stages a portable `dist/` folder, and compiles
+`installer.nsi` with NSIS. Run the installer normally: it installs per-machine
+when elevated and per-user otherwise.
 
 Once the build finishes, the compiled output can be found in:
 

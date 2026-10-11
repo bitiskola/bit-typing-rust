@@ -1,0 +1,38 @@
+# Rust build artifacts
+/target/
+
+# Local build outputs: .deb staging, NSIS installer, portable dist/
+outputs/
+dist/
+build/
+build-resources/
+
+# Runtime course-pack clones (per-machine git checkouts, can be re-fetched)
+repos/
+
+# Per-user lessons saved from a checkout run (no bundled courses by design;
+# lessons ship via git course packs — see details.json)
+courses/*.txt
+
+# Runtime-generated app data (tracked seeds like data/settings.json and
+# data/sounds/*.wav are unaffected — gitignore never hides tracked files)
+data/history.json
+data/course_repos.json
+data/custom_courses.json
+*.tmp
+
+# Python bytecode / caches / envs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

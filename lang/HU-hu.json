@@ -45,6 +45,16 @@
     "setup_welcome": "Üdv a bit-typingban!", "setup_intro": "Az első lecke előtt szabjuk személyre a gépelési élményt.",
     "setup_language_heading": "Nyelv és billentyűzet", "setup_preferences_heading": "Gyakorlási beállítások",
     "setup_change_later": "Ezeket később a Beállításokban is módosíthatod.", "finish_setup": "Beállítás befejezése",
-    "history_summary": "{count} próbálkozás     Legjobb sebesség  {best:.1f} {unit}     Átlagos pontosság  {accuracy:.1f}%"
+    "history_summary": "{count} próbálkozás     Legjobb sebesség  {best:.1f} {unit}     Átlagos pontosság  {accuracy:.1f}%",
+    "course_repos": "Leckecsomagok", "course_repos_tip": "A leckék git tárolókból töltődnek be, az aktív billentyűzetkiosztás szerint szűrve. ★ jelöli a beépített csomagot.",
+    "remove": "Eltávolítás", "repo_url_hint": "https://github.com/…/courses.git", "add_repo": "Tároló hozzáadása", "refresh_all": "Mind frissítése",
+    "repo_empty_url": "Add meg a tároló URL-jét.", "repo_already_added": "Ez a tároló már hozzá van adva.",
+    "repo_added": "Hozzáadva: {name}.", "repo_add_failed": "A tároló nem adható hozzá",
+    "repo_default_locked": "A beépített leckecsomag nem távolítható el.", "repo_removed": "Eltávolítva: {name}.",
+    "repo_refreshed": "{count} csomag frissítve.", "repo_refresh_partial": "Néhány csomag nem frissíthető",
+    "finish_early": "Korai befejezés", "finish_early_tip": "Állj meg most, mentsd a részeredményt; később a Statisztikából folytathatod.",
+    "continuing_unfinished": "Befejezetlen gyakorlás folytatása — a befejezés ugyanazt a sort frissíti.",
+    "continue_lesson": "Folytatás", "unfinished": "befejezetlen",
+    "results_unfinished_note": "Korán befejezve — keresd a Statisztikában, és nyomd meg a Folytatást a maradék begépeléséhez."
   }
 }

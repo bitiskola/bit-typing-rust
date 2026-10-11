@@ -110,6 +110,12 @@ pub fn settings_file(root: &Path) -> PathBuf {
 pub fn custom_courses_file(root: &Path) -> PathBuf {
     data_dir(root).join("custom_courses.json")
 }
+pub fn repos_dir(root: &Path) -> PathBuf {
+    root.join("repos")
+}
+pub fn repos_file(root: &Path) -> PathBuf {
+    data_dir(root).join("course_repos.json")
+}
 
 /// Source-tree fallback for seeds when not running from a checkout
 /// (installed Linux package, macOS .app, Windows install).
@@ -238,6 +244,7 @@ pub fn ensure_dirs(root: &Path) {
         keyboards_dir(root),
         data_dir(root),
         sounds_dir(root),
+        repos_dir(root),
     ] {
         let _ = std::fs::create_dir_all(&dir);
     }
@@ -391,15 +398,17 @@ mod tests {
         );
     }
 
-    /// Fresh installs must seed a FLAT layout (courses/01.txt, not
-    /// courses/courses/01.txt) or the app finds nothing.
+    /// Fresh installs must seed a FLAT layout (lang/HU-hu.json, not
+    /// lang/lang/HU-hu.json) or the app finds nothing. courses/ stays as an
+    /// (empty) writable dir for per-user custom lessons; lessons themselves
+    /// arrive via git course packs, not the bundle.
     #[test]
     fn ensure_dirs_seeds_flat_layout() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         // Parallel-safe: only asserts files this test's own seeding creates.
         ensure_dirs(&root);
-        assert!(courses_dir(&root).join("01.txt").is_file(), "top-level lesson");
+        assert!(courses_dir(&root).is_dir(), "writable courses dir");
         assert!(langs_dir(&root).join("HU-hu.json").is_file(), "top-level lang");
         assert!(
             std::fs::read_dir(keyboards_dir(&root)).unwrap().count() > 0,
@@ -425,14 +434,15 @@ mod tests {
         std::env::remove_var("BIT_TYPING_SYSTEM_DIR");
         ensure_dirs(&root);
         // Plant a doubled folder with only bundled names -> removed.
-        let doubled = courses_dir(&root).join("courses");
+        // (lang pack: HU-hu.json is bundled; courses are repo-provided now.)
+        let doubled = langs_dir(&root).join("lang");
         std::fs::create_dir_all(&doubled).unwrap();
-        std::fs::write(doubled.join("01.txt"), "x").unwrap();
+        std::fs::write(doubled.join("HU-hu.json"), "x").unwrap();
         ensure_dirs(&root);
         assert!(!doubled.exists(), "pure-bundled doubled dir removed");
         // Plant one with a custom lesson -> preserved.
         std::fs::create_dir_all(&doubled).unwrap();
-        std::fs::write(doubled.join("01.txt"), "x").unwrap();
+        std::fs::write(doubled.join("HU-hu.json"), "x").unwrap();
         std::fs::write(doubled.join("my-lesson.txt"), "custom").unwrap();
         ensure_dirs(&root);
         assert!(doubled.join("my-lesson.txt").is_file(), "custom data kept");

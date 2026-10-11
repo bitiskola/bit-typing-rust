@@ -1,9 +1,9 @@
 //! Build script: inventory default resources and emit a manifest.
 //!
-//! Mirrors `build_resources.py`: hashes every file under `courses/*.txt`,
-//! `lang/*.json` and `keyboards/*.json`, writes
-//! `target/.../default-resources.json`, and exposes the manifest path and
-//! version to the crate via `env!`.
+//! Lessons are no longer bundled: courses come from git course packs
+//! (see `src/repos.rs`, `details.json`) and per-user `courses/*.txt` files.
+//! The manifest therefore covers `courses/*.txt` only when present, and
+//! always covers `lang/*.json` and `keyboards/*.json`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,24 +11,31 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-const GROUPS: &[(&str, &str)] = &[
-    ("courses", "txt"),
-    ("lang", "json"),
-    ("keyboards", "json"),
+// `required=false` for courses: an empty/missing courses dir is a valid
+// repo-less checkout (lessons arrive via course repos at runtime).
+const GROUPS: &[(&str, &str, bool)] = &[
+    ("courses", "txt", false),
+    ("lang", "json", true),
+    ("keyboards", "json", true),
 ];
 
 fn inventory(project: &Path) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
-    for (folder, ext) in GROUPS {
+    for (folder, ext, required) in GROUPS {
         let dir = project.join(folder);
         let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("missing {folder}/ dir: {e}"))
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == *ext).unwrap_or(false) && p.is_file())
-            .collect();
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().map(|x| x == *ext).unwrap_or(false) && p.is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
         entries.sort();
         if entries.is_empty() {
-            panic!("No default {folder}/*.{ext} files in {}. Build from the complete source folder.", project.display());
+            if *required {
+                panic!("No default {folder}/*.{ext} files in {}. Build from the complete source folder.", project.display());
+            }
+            continue;
         }
         for path in entries {
             let bytes = fs::read(&path)
@@ -74,7 +81,7 @@ fn main() {
     )
     .expect("write manifest");
     println!(
-        "cargo:warning=Bundling {} default courses, languages, and keyboard layouts.",
+        "cargo:warning=Bundling {} default resource files (courses come from repos, not the bundle).",
         files.len()
     );
     println!(
@@ -88,10 +95,10 @@ fn main() {
     embed_windows_icon();
 }
 
-/// Embed the application icon into Windows executables from a `.ico` file
-/// derived from `assets/favico.png` (`build_win.bat` generates it with
-/// Pillow and points `BIT_TYPING_FAVICO` at it). Missing toolkit or icon
-/// only warns — Linux/macOS and icon-less builds are unaffected.
+/// Embed the application icon into Windows executables from the shipped
+/// `assets/favico.ico` (`BIT_TYPING_FAVICO` overrides it, as `build_win.bat`
+/// does). A missing icon only warns — Linux/macOS and icon-less builds are
+/// unaffected.
 fn embed_windows_icon() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

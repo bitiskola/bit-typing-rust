@@ -3,12 +3,13 @@
 #
 # Mirrors the old Python `build_linux.sh` step for step, with cargo in place
 # of the Python venv + PyInstaller:
-#   1. check-source (default courses / languages / layouts present),
+#   1. check-source (default languages / layouts present; courses optional,
+#      lessons arrive via git course packs),
 #   2. `cargo build --release`,
 #   3. verify the binary (`--verify-resources`, like `verify-executable`),
 #   4. stage a .deb (desktop file, icons, control, postinst).
 #
-# Usage: ./build_linux.sh [version]   (default 2.0.0, must match Cargo.toml)
+# Usage: ./build_linux.sh [version]   (default 2.1.0, must match Cargo.toml)
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +23,7 @@ else
 fi
 
 OUTPUT_DIR="$PROJECT_DIR/outputs"
-PACKAGE_VERSION="${1:-2.0.0}"
+PACKAGE_VERSION="${1:-2.1.0}"
 PACKAGE_NAME="bit-typing"
 ICON_SOURCE="$PROJECT_DIR/assets/favico.png"
 CARGO_TOML_VERSION="$(grep -m1 '^version' "$PROJECT_DIR/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -91,15 +92,19 @@ mkdir -p \
 install -m 0755 "$BINARY" "$PACKAGE_ROOT/usr/bin/bit-typing"
 
 # System-wide default resources. The app seeds the writable per-user dirs
-# from these on first launch (and falls back to its embedded copies), so a
-# fresh install finds lessons, layouts, languages, and artwork immediately.
+# from these on first launch (and falls back to its embedded copies).
+# Lessons are NOT bundled: they arrive via git course packs at runtime
+# (see details.json / Options > Course repositories); the courses dir is
+# still staged (possibly empty) for per-user custom lessons.
 install -d "$PACKAGE_ROOT/usr/share/bit-typing/courses" \
     "$PACKAGE_ROOT/usr/share/bit-typing/keyboards" \
     "$PACKAGE_ROOT/usr/share/bit-typing/lang" \
     "$PACKAGE_ROOT/usr/share/bit-typing/assets"
+shopt -s nullglob
 for lesson in "$PROJECT_DIR"/courses/*.txt; do
     install -m 0644 "$lesson" "$PACKAGE_ROOT/usr/share/bit-typing/courses/"
 done
+shopt -u nullglob
 for layout in "$PROJECT_DIR"/keyboards/*.json; do
     install -m 0644 "$layout" "$PACKAGE_ROOT/usr/share/bit-typing/keyboards/"
 done
