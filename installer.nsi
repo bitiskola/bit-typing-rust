@@ -17,10 +17,16 @@
   !error "Pass the app version: makensis /DVERSION=<Cargo.toml version> installer.nsi"
 !endif
 
+!ifndef APP_ICON
+  !define APP_ICON "assets\favico.ico"
+!endif
+!define MUI_ICON "${APP_ICON}"
+!define MUI_UNICON "${APP_ICON}"
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
 !include "StrFunc.nsh"
+${Using:StrFunc} StrRep  ; Declare the installer-side StrRep function.
 !include "nsDialogs.nsh"
 
 !define APP_NAME "bit-typing"
@@ -51,10 +57,6 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "FileDescription" "Modern typing practice application"
 VIAddVersionKey "FileVersion" "${VERSION}"
-!ifdef APP_ICON
-Icon "${APP_ICON}"
-UninstallIcon "${APP_ICON}"
-!endif
 SetCompressor /SOLID lzma
 
 ; ---- Pages ------------------------------------------------------------------
@@ -62,6 +64,7 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MULTIUSER_PAGE_INSTALLMODE
 !insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -78,7 +81,8 @@ Function un.onInit
 FunctionEnd
 
 ; ---- Install ----------------------------------------------------------------
-Section "Install"
+Section "Install application" SEC_MAIN
+  SectionIn RO ; Always install the application; this cannot be deselected.
   ; Native registry view for machine installs (no-op otherwise).
   ${If} $MultiUser.Privileges == "Admin"
     SetRegView 64
@@ -95,8 +99,6 @@ Section "Install"
   ; Lessons ship via git course packs (see details.json); the folder is still
   ; created for per-user custom lessons. No bundled *.txt is an error-free
   ; no-op for File wildcards, so this stays correct either way.
-  CreateDirectory "$INSTDIR\courses"
-  File "courses\*.txt"
 
   ; install-info.json marks an installed (non-portable) layout for the app
   ; and records scope for tooling. Backslashes must be JSON-escaped.
@@ -117,7 +119,6 @@ Section "Install"
   WriteRegStr SHCTX "Software\${APP_NAME}" "InstallDir" "$INSTDIR"
 
   ; Shortcuts (shell folders follow the MultiUser context).
-  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_NAME}.exe" "" "$INSTDIR\${APP_NAME}.exe" 0
   CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_NAME}.exe" "" "$INSTDIR\${APP_NAME}.exe" 0
 
   ; Add/Remove Programs entry.
@@ -137,6 +138,12 @@ Section "Install"
   WriteRegStr SHCTX "${UNINSTALL_KEY}" "InstallDate" "$R0"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
+SectionEnd
+
+; Desktop shortcut is selected by default in the Components page.
+; Users can uncheck it without affecting the Start Menu shortcut.
+Section "Create desktop shortcut" SEC_DESKTOP
+  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_NAME}.exe" "" "$INSTDIR\${APP_NAME}.exe" 0
 SectionEnd
 
 ; ---- Uninstall options page (optional per-user data removal) ----------------

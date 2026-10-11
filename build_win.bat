@@ -29,13 +29,18 @@ if errorlevel 1 (
     goto :failed
 )
 
-where makensis >nul 2>nul
-if errorlevel 1 (
-    echo ERROR: makensis was not found.
-    echo Install NSIS 3 from https://nsis.sourceforge.io/ and retry
-    echo ^(the installer directory must be on PATH^).
+rem Locate NSIS via PATH or common Windows installation directories.
+set "MAKENSIS="
+for %%I in (makensis.exe) do set "MAKENSIS=%%~$PATH:I"
+if not defined MAKENSIS if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles(x86)%\NSIS\makensis.exe"
+if not defined MAKENSIS if exist "%ProgramFiles%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles%\NSIS\makensis.exe"
+if not defined MAKENSIS if exist "%LOCALAPPDATA%\Programs\NSIS\makensis.exe" set "MAKENSIS=%LOCALAPPDATA%\Programs\NSIS\makensis.exe"
+if not defined MAKENSIS (
+    echo ERROR: makensis.exe was not found in PATH or standard NSIS locations.
+    echo Install NSIS 3 or add its installation directory to PATH.
     goto :failed
 )
+echo Using NSIS: %MAKENSIS%
 
 if not exist "assets\favico.png" (
     echo ERROR: assets\favico.png is missing.
@@ -89,7 +94,7 @@ echo.
 echo [3/3] Building installer with NSIS...
 if not exist "outputs" mkdir "outputs"
 if errorlevel 1 goto :failed
-makensis /DVERSION=%PACKAGE_VERSION% "/DAPP_ICON=%CD%\assets\favico.ico" installer.nsi
+"%MAKENSIS%" /DVERSION=%PACKAGE_VERSION% "/DAPP_ICON=%CD%\assets\favico.ico" installer.nsi
 if errorlevel 1 goto :failed
 if not exist "outputs\bit-typing-setup.exe" (
     echo ERROR: outputs\bit-typing-setup.exe was not created.
