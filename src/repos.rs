@@ -332,57 +332,145 @@ fn details_with_fallback(repo_dir: &Path, slug: &str) -> RepoDetails {
 
 // ---------------------------------------------------------------------------
 // git sync
+//
+// There is no builtin git: the app shells out to a `git` binary, resolved as
+//  1. `git` on PATH (the Linux .deb depends on git; dev machines too),
+//  2. the MinGit tree bundled beside the app binary by the NSIS installer
+//     (`<exe-dir>/git/cmd/git.exe`), for Windows PCs without git installed.
 // ---------------------------------------------------------------------------
 
-fn git_available() -> bool {
-    Command::new("git").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+/// Resolve the git binary to shell out to: system git first (respects the
+/// user's config), bundled MinGit next to the app binary as a fallback.
+pub fn git_program() -> Option<PathBuf> {
+    let probe = Command::new("git").arg("--version").output();
+    if matches!(probe, Ok(o) if o.status.success()) {
+        return Some(PathBuf::from("git"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("git").join("cmd").join("git.exe");
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+        }
+    }
+    None
+}
+
+/// True when `dest` is a git checkout git itself accepts (guards against
+/// stale/corrupt `.git` dirs left by interrupted clones: those make every
+/// later `pull` fail with "not a git repository" forever).
+fn checkout_valid(git: &Path, dest: &Path) -> bool {
+    Command::new(git)
+        .args(["-C", &dest.to_string_lossy(), "rev-parse", "--git-dir"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn clone_fresh(url: &str, slug: &str, dest: &Path, git: &Path) -> Result<RepoDetails, String> {
+    let out = Command::new(git)
+        .args(["clone", "--depth", "1", url, &dest.to_string_lossy()])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let _ = std::fs::remove_dir_all(dest);
+        return Err(if msg.is_empty() { "git clone failed".to_string() } else { msg });
+    }
+    Ok(details_with_fallback(dest, slug))
+}
+
+/// Recover a checkout whose `.git` exists but git rejects (interrupted
+/// clone, foreign files): clone into a temp sibling dir first and swap it
+/// in, so usable local files are never destroyed by a failed network op.
+fn recover_corrupt(
+    repos_root: &Path,
+    url: &str,
+    slug: &str,
+    dest: &Path,
+    git: &Path,
+) -> Result<RepoDetails, String> {
+    let tmp = repos_root.join(format!(".{slug}.reclone"));
+    let backup = repos_root.join(format!(".{slug}.backup"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&backup);
+    let out = Command::new(git)
+        .args(["clone", "--depth", "1", url, &tmp.to_string_lossy()])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Offline: keep serving whatever usable files survive locally.
+        let details = details_with_fallback(dest, slug);
+        if details.courses.is_empty() {
+            return Err(if msg.is_empty() { "git clone failed".to_string() } else { msg });
+        }
+        return Ok(details);
+    }
+    // Swap in the fresh clone; restore the old checkout if the swap fails.
+    let swapped = std::fs::rename(dest, &backup).is_ok()
+        && std::fs::rename(&tmp, dest).is_ok();
+    if swapped {
+        let _ = std::fs::remove_dir_all(&backup);
+        return Ok(details_with_fallback(dest, slug));
+    }
+    let _ = std::fs::rename(&backup, dest);
+    let _ = std::fs::remove_dir_all(&tmp);
+    let details = details_with_fallback(dest, slug);
+    if details.courses.is_empty() {
+        return Err("could not replace corrupt course checkout".to_string());
+    }
+    Ok(details)
 }
 
 /// Clone a missing repo or pull an existing one. Returns the parsed details.
-/// Network/git failures are returned as `Err`, but an existing local copy is
-/// left untouched so the app keeps working offline.
+/// A checkout whose `.git` exists but git rejects is recovered via a temp-dir
+/// re-clone (never destroying usable local files on network failure).
+/// Other pull failures (offline, …) still serve the local copy when usable.
+/// Network/git failures with nothing usable locally are returned as `Err`.
 pub fn refresh_repo(repos_root: &Path, url: &str) -> Result<RepoDetails, String> {
     let slug = slug_for_url(url);
     let dest = repos_root.join(&slug);
     let _ = std::fs::create_dir_all(repos_root);
-    if dest.join(".git").is_dir() {
-        if !git_available() {
-            return Ok(details_with_fallback(&dest, &slug));
-        }
-        let out = Command::new("git")
-            .args(["-C", &dest.to_string_lossy(), "pull", "--ff-only"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            // Offline / up-to-date edge: still serve local files.
-            let details = details_with_fallback(&dest, &slug);
-            if details.courses.is_empty() && !dest.is_dir() {
-                return Err(if msg.is_empty() { "git pull failed".to_string() } else { msg });
+    let git = git_program();
+    if dest.join(".git").exists() {
+        match git {
+            Some(ref g) if checkout_valid(g, &dest) => {
+                let out = Command::new(g)
+                    .args(["-C", &dest.to_string_lossy(), "pull", "--ff-only"])
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if out.status.success() {
+                    return Ok(details_with_fallback(&dest, &slug));
+                }
+                // Offline / diverged / up-to-date edge: still serve locals.
+                let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let details = details_with_fallback(&dest, &slug);
+                if details.courses.is_empty() {
+                    return Err(if msg.is_empty() { "git pull failed".to_string() } else { msg });
+                }
+                return Ok(details);
             }
-            if !out.status.success() && details.courses.is_empty() {
-                return Err(if msg.is_empty() { "git pull failed".to_string() } else { msg });
+            Some(ref g) => {
+                return recover_corrupt(repos_root, url, &slug, &dest, g);
             }
-            return Ok(details);
+            None => {
+                return Ok(details_with_fallback(&dest, &slug));
+            }
         }
-        Ok(details_with_fallback(&dest, &slug))
-    } else if dest.is_dir() {
+    }
+    if dest.is_dir() {
         // Manually placed (non-git) course pack: serve it as-is.
-        Ok(details_with_fallback(&dest, &slug))
-    } else {
-        if !git_available() {
-            return Err("git is not installed, cannot clone repository".to_string());
-        }
-        let out = Command::new("git")
-            .args(["clone", "--depth", "1", url, &dest.to_string_lossy()])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let _ = std::fs::remove_dir_all(&dest);
-            return Err(if msg.is_empty() { "git clone failed".to_string() } else { msg });
-        }
-        Ok(details_with_fallback(&dest, &slug))
+        return Ok(details_with_fallback(&dest, &slug));
+    }
+    match git {
+        Some(ref g) => clone_fresh(url, &slug, &dest, g),
+        None => Err(
+            "git is not available (not on PATH and no bundled git found next to the app)"
+                .to_string(),
+        ),
     }
 }
 
@@ -602,8 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn next_course_same_pack_only() {
-        let mk = |id: &str, title: &str, repo: &str, layout: &str| AvailableCourse {
+    fn next_course_same_pack_only() {        let mk = |id: &str, title: &str, repo: &str, layout: &str| AvailableCourse {
             id: id.to_string(), title: title.to_string(), repo_name: repo.to_string(),
             layout: layout.to_string(), path: PathBuf::from(id), course_file: id.to_string(), custom: false,
         };
@@ -615,5 +702,78 @@ mod tests {
         let next = next_course(&avail, "a").unwrap();
         assert_eq!(next.id, "b");
         assert!(next_course(&avail, "b").is_none());
+    }
+
+    #[test]
+    fn git_program_prefers_system_git() {
+        let system = Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        match git_program() {
+            // System git wins so user config/proxies keep working.
+            Some(p) if system => assert_eq!(p, PathBuf::from("git")),
+            // No system git: bundled MinGit (or nothing) is acceptable.
+            Some(_) => {}
+            None => assert!(!system, "system git works but nothing resolved"),
+        }
+    }
+
+    /// Regression test for "fatal: not a git repository" sticking forever:
+    /// a `.git` dir git rejects (interrupted clone, foreign files) is
+    /// recovered via temp-dir re-clone instead of erroring every refresh.
+    #[test]
+    fn corrupt_checkout_recovers_via_reclone() {
+        let git_ok = Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(git_ok, "test requires git on PATH");
+        let tmp = tempfile::tempdir().unwrap();
+        // Source repo with one course (local path = offline-capable "url").
+        let src = tmp.path().join("pack-src");
+        std::fs::create_dir_all(src.join("HU-qwertz")).unwrap();
+        std::fs::write(
+            src.join("details.json"),
+            r#"{"name":"Pack","creator":"me","courses":{"HU-qwertz":["HU-qwertz/a.txt"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("HU-qwertz/a.txt"), "hello").unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&src).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["add", "-A"]);
+        git(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "init"]);
+        let repos_root = tmp.path().join("repos");
+        let url = src.to_string_lossy().to_string();
+        // First refresh clones.
+        let d = refresh_repo(&repos_root, &url).unwrap();
+        assert_eq!(d.courses.len(), 1);
+        let dest = repos_root.join("pack-src");
+        assert!(dest.join(".git").is_dir());
+        // Simulate the reported failure: a `.git` dir git rejects.
+        std::fs::remove_dir_all(dest.join(".git")).unwrap();
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        // Recovery re-clones from the source; courses work again.
+        let d2 = refresh_repo(&repos_root, &url).unwrap();
+        assert_eq!(d2.courses.len(), 1);
+        assert!(dest.join(".git").join("HEAD").is_file());
+        assert!(dest.join("HU-qwertz").join("a.txt").is_file());
+        // No temp leftovers leak into the repos root.
+        let leftovers: Vec<_> = std::fs::read_dir(&repos_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "temp dirs leaked: {leftovers:?}");
     }
 }

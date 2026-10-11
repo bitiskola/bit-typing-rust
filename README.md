@@ -19,9 +19,11 @@ Public source code for **BIT Typing**, a Rust-based version of the application.
 
 The optional version defaults to the `Cargo.toml` version and must match it.
 The script runs the test suite, builds `bit-typing.exe` (with the embedded
-`assets/favico.ico` icon), stages a portable `dist/` folder, and compiles
-`installer.nsi` with NSIS. Run the installer normally: it installs per-machine
-when elevated and per-user otherwise.
+`assets/favico.ico` icon), stages a portable `dist/` folder, fetches portable
+MinGit into `dist/git` (cached between builds, needs network once) so course
+sync works on PCs without git, and compiles `installer.nsi` with NSIS. Run
+the installer normally: it installs per-machine when elevated and per-user
+otherwise.
 
 Once the build finishes, the compiled output can be found in:
 
@@ -42,6 +44,9 @@ outputs/
 ```bash
 ./build_linux.sh
 ```
+
+The resulting `.deb` depends on `git` (course lessons sync from git repos),
+installed automatically with the package.
 
 Once the build finishes, the compiled output can be found in:
 

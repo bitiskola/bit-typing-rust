@@ -165,7 +165,7 @@ Priority: optional
 Architecture: $ARCHITECTURE
 Maintainer: micr0softstore <kokai.balazs@bit-edu.hu>
 Installed-Size: $INSTALLED_SIZE
-Depends: libc6, libx11-6, libgl1, libxkbcommon0, libwayland-client0, libasound2t64 | libasound2
+Depends: libc6, libx11-6, libgl1, libxkbcommon0, libwayland-client0, libasound2t64 | libasound2, git
 Description: Modern typing practice application
  bit-typing provides typing lessons, custom courses, a virtual keyboard,
  localized interfaces, and detailed learning statistics.

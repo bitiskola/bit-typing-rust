@@ -62,7 +62,7 @@ if not exist "dist" mkdir "dist"
 if errorlevel 1 goto :failed
 
 echo.
-echo [1/3] Building bit-typing.exe (Rust, icon embedded from assets\favico.ico)...
+echo [1/4] Building bit-typing.exe (Rust, icon embedded from assets\favico.ico)...
 set "BIT_TYPING_FAVICO=%CD%\assets\favico.ico"
 cargo build --release --bin bit-typing
 if errorlevel 1 goto :failed
@@ -76,7 +76,7 @@ copy /Y "target\release\bit-typing.exe" "dist\bit-typing.exe" >nul
 if errorlevel 1 goto :failed
 
 echo.
-echo [2/3] Staging portable files...
+echo [2/4] Staging portable files...
 xcopy /E /I /Y "assets" "dist\assets\" >nul
 if errorlevel 1 goto :failed
 xcopy /E /I /Y "keyboards" "dist\keyboards\" >nul
@@ -91,7 +91,17 @@ xcopy /E /I /Y "lang" "dist\lang\" >nul
 if errorlevel 1 goto :failed
 
 echo.
-echo [3/3] Building installer with NSIS...
+echo [3/4] Fetching bundled git ^(MinGit, skipped when already staged^)...
+if not exist "dist\git\cmd\git.exe" call :fetch_mingit
+if errorlevel 1 goto :failed
+"dist\git\cmd\git.exe" --version
+if errorlevel 1 (
+    echo ERROR: bundled git at dist\git\cmd\git.exe does not run.
+    goto :failed
+)
+
+echo.
+echo [4/4] Building installer with NSIS...
 if not exist "outputs" mkdir "outputs"
 if errorlevel 1 goto :failed
 "%MAKENSIS%" /DVERSION=%PACKAGE_VERSION% "/DAPP_ICON=%CD%\assets\favico.ico" installer.nsi
@@ -112,6 +122,30 @@ echo for per-machine installs and installs per-user otherwise.
 echo ============================================================
 echo.
 pause
+exit /b 0
+
+rem Downloads + extracts portable MinGit into dist\git (cached: skipped when
+rem dist\git\cmd\git.exe already exists). Latest release is resolved via the
+rem GitHub API so the script needs no version bumps; a stale cache keeps
+rem working offline. Each line here parses separately (no delayed expansion).
+:fetch_mingit
+set "MINGIT_URL="
+for /f "usebackq delims=" %%u in (`powershell -NoProfile -Command "(Invoke-RestMethod https://api.github.com/repos/git-for-windows/git/releases/latest).assets ^| Where-Object { $_.name -like 'MinGit-*-64-bit.zip' } ^| Select-Object -First 1 -ExpandProperty browser_download_url"`) do set "MINGIT_URL=%%u"
+if "%MINGIT_URL%"=="" (
+    echo ERROR: could not resolve the latest MinGit URL ^(network or API limit?^).
+    exit /b 1
+)
+echo Downloading MinGit for bundled git support...
+echo   %MINGIT_URL%
+curl.exe -sSL -o "dist\mingit.zip" "%MINGIT_URL%" >nul 2>nul
+if not exist "dist\mingit.zip" powershell -NoProfile -Command "Invoke-WebRequest -Uri '%MINGIT_URL%' -OutFile 'dist\mingit.zip'"
+if not exist "dist\mingit.zip" (
+    echo ERROR: MinGit download failed and no cached copy exists.
+    exit /b 1
+)
+powershell -NoProfile -Command "Expand-Archive -Path 'dist\mingit.zip' -DestinationPath 'dist\git' -Force"
+if errorlevel 1 exit /b 1
+del "dist\mingit.zip" >nul 2>nul
 exit /b 0
 
 :failed

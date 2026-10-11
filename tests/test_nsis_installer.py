@@ -121,6 +121,27 @@ class NsisInstallerTests(unittest.TestCase):
         self.assertIn("${APP_TITLE}.lnk", nsi)
         self.assertIn("Uninstall\\${APP_TITLE}", nsi)
 
+    def test_bundled_git_staged_and_removed(self):
+        nsi = read("installer.nsi")
+        # MinGit tree ships beside the EXE; the app falls back to it when no
+        # system git is on PATH (<exe-dir>/git/cmd/git.exe).
+        self.assertIn("dist\\git", nsi)
+        self.assertIn("File /r", nsi)
+        self.assertIn("$INSTDIR\\git", nsi)
+        self.assertIn('RMDir /r "$INSTDIR\\git"', nsi)
+
+    def test_build_script_fetches_mingit(self):
+        bat = read("build_win.bat")
+        for token in ("MinGit", "Expand-Archive", "dist\\git\\cmd\\git.exe"):
+            with self.subTest(token=token):
+                self.assertIn(token, bat)
+
+    def test_linux_package_depends_on_git(self):
+        control = read("build_linux.sh")
+        match = re.search(r"^Depends:(.*)$", control, re.M)
+        self.assertIsNotNone(match, "no Depends: line in build_linux.sh")
+        self.assertIn("git", [d.strip() for d in match.group(1).split(",")])
+
     def test_shipped_exe_icon_is_valid_ico(self):
         ico = PROJECT / "assets" / "favico.ico"
         self.assertTrue(ico.is_file(), "assets/favico.ico is missing")
