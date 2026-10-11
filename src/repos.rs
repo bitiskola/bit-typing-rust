@@ -97,7 +97,7 @@ impl AvailableCourse {
 /// Normalise a URL for default-repo comparison (trailing `/`, `.git`).
 fn normalise_url(url: &str) -> String {
     let mut s = url.trim().to_string();
-    while s.ends_with('/') {
+    while s.ends_with('/') || s.ends_with('\\') {
         s.pop();
     }
     if s.to_lowercase().ends_with(".git") {
@@ -113,7 +113,9 @@ pub fn is_default_repo(url: &str) -> bool {
 /// Filesystem-safe slug for a repo URL (`.../bit-typing-main` -> `bit-typing-main`).
 pub fn slug_for_url(url: &str) -> String {
     let clean = normalise_url(url);
-    let last = clean.rsplit('/').next().unwrap_or("repo").trim();
+    // Split on both separators: URLs use `/`, Windows paths (used as local
+    // clone sources, e.g. in tests) use `\`.
+    let last = clean.rsplit(['/', '\\']).next().unwrap_or("repo").trim();
     let mut slug: String = last
         .chars()
         .map(|c| {
@@ -639,6 +641,9 @@ mod tests {
     fn slug_and_default() {
         assert_eq!(slug_for_url("https://github.com/bitiskola/bit-typing-main"), "bit-typing-main");
         assert_eq!(slug_for_url("https://github.com/x/y.git/"), "y");
+        // Windows local paths (backslashes) slug to their last segment too.
+        assert_eq!(slug_for_url(r"C:\Users\me\AppData\Local\Temp\pack-src"), "pack-src");
+        assert_eq!(slug_for_url(r"C:\repos\pack.git"), "pack");
         assert!(is_default_repo("https://github.com/bitiskola/bit-typing-main.git"));
         let mut v = vec!["https://example.com/other".to_string()];
         ensure_default_repo(&mut v);
